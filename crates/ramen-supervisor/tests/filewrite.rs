@@ -691,11 +691,18 @@ fn symlink_swap_during_window_cannot_steer_the_write() {
     let fx = WriteFixture::new();
     let requirement = format!("identifier \"{}\"", common::test_binary_identifier());
     let body = fx.fx.parts.body_with_prefixes(&requirement, std::slice::from_ref(&fx.prefix));
-    // 5-second window between the durable `Authorized` record and the effect.
+    // Barrier window between the durable `Authorized` record and the effect:
+    // the effect cannot begin until the test creates the barrier file *after
+    // performing the swap below*, so pin < swap < write holds by
+    // construction. A duration-based pause instead would let a loaded
+    // machine land the swap after the write, and this test would pass
+    // vacuously — the failure mode least wanted on the test guarding the pin.
+    let barrier = fx.dir().join("SWAP_DONE");
+    let barrier_s = barrier.to_string_lossy().into_owned();
     let mut sup = Supervisor::start_with_body_env(
         &fx.fx,
         &body,
-        &[("RAMEN_TEST_PAUSE_AFTER_AUTHORIZED", "5")],
+        &[("RAMEN_TEST_BARRIER_BEFORE_EFFECT", barrier_s.as_str())],
     );
 
     let dir = fx.dir();
@@ -739,7 +746,12 @@ fn symlink_swap_during_window_cannot_steer_the_write() {
     std::fs::rename(&a, &a_real).unwrap();
     std::os::unix::fs::symlink(&b, &a).unwrap();
 
-    // The effect (after the 5-second window) must write through the pin.
+    // Release the effect only now, with the swap in place: the write cannot
+    // have started before this point, so the swap is inside the pin→write
+    // window by construction — no timing assumption anywhere in the test.
+    std::fs::write(&barrier, b"go").unwrap();
+
+    // The effect must write through the pin.
     let resp = match client.recv() {
         Some(ramen_proto::Message::Response(r)) => r,
         other => panic!("expected Response, got {other:?}"),

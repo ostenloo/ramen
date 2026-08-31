@@ -714,6 +714,28 @@ impl Connection {
             tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
         }
 
+        // Test-only hook: wait for a barrier file before running the effect.
+        // The pin race test uses this to *synchronize* the swap into the
+        // pin→write window instead of racing a sleep duration: the effect
+        // cannot begin until the test has performed its swap and created the
+        // file, so the interleaving is guaranteed by construction. A
+        // duration-based window here would let a loaded machine land the
+        // swap after the write, and the test would pass vacuously.
+        if let Some(p) = std::env::var_os("RAMEN_TEST_BARRIER_BEFORE_EFFECT") {
+            let path = std::path::PathBuf::from(p);
+            tracing::info!(
+                "test hook: waiting for barrier file {} before FileWrite {}",
+                path.display(),
+                effect.req.id
+            );
+            loop {
+                if path.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+
         // (5) The effect, then the terminal record. Every syscall is
         // `*at`-relative to `pinned`.
         match filewrite::execute_pinned(
