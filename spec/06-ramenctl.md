@@ -105,7 +105,7 @@ Commands:
 | Command | Behavior |
 |---|---|
 | `whoami` | Issues `Whoami`, prints identity, session, capabilities. |
-| `write <path>` | Issues `FileWrite`. Content from `--content` or stdin. `--create` selects `Create` mode; default is `Overwrite`. |
+| `write <path>` | Issues `FileWrite`. Content from `--content` or stdin. `--create` selects `Create` mode; default is `Overwrite`. The CLI decodes nothing here — it counts the content bytes up front and rejects content over the 256 KiB cap (`05-operations.md` M6) with a usage error (exit 3) before connecting, rather than spending a round trip on a request the supervisor would reject as `Error/MalformedRequest`. |
 | `ping` | Connects, completes handshake, disconnects. Exercises handshake alone. |
 | `conform` | Protocol conformance harness (§4). |
 

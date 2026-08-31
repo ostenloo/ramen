@@ -399,3 +399,26 @@ fn audit_log_survives_hostile_conform_run() {
         String::from_utf8_lossy(&verify.stderr)
     );
 }
+
+#[test]
+fn write_preflights_content_size_before_connecting() {
+    let ctl = ctl();
+    // One byte over the supervisor's 256 KiB content cap.
+    let big = "x".repeat(256 * 1024 + 1);
+    let target = ctl.workdir.join("big.txt");
+    let target_s = target.display().to_string();
+    let out = run_ctl(
+        &ctl,
+        false,
+        &["write", &target_s, "--create", "--content", &big],
+    );
+    // A usage error, not a round trip: the caller's input is at fault, so it
+    // fails locally with exit 3 before any connection is opened.
+    assert_eq!(out.status.code(), Some(3), "stderr: {:?}", out.stderr);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("256 KiB"),
+        "the preflight message should name the cap; stderr: {stderr}"
+    );
+    assert!(!target.exists(), "nothing may be written");
+}

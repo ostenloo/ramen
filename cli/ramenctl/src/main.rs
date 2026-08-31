@@ -201,6 +201,19 @@ async fn dispatch(args: &Args, token: &UnverifiedBiscuit) -> ExitCode {
                     }
                 }
             };
+            // Preflight: the supervisor caps decoded content at 256 KiB
+            // (`05-operations.md` M6). Fail locally with a usage error
+            // instead of spending a round trip on a request the supervisor
+            // will reject as `MalformedRequest`.
+            if content.len() > 256 * 1024 {
+                return usage_failure(
+                    args,
+                    &format!(
+                        "content is {} bytes; the supervisor's cap is 256 KiB",
+                        content.len()
+                    ),
+                );
+            }
             let op = Operation::FileWrite(ramen_sdk::FileWriteOp {
                 path: path.display().to_string(),
                 content_b64: base64::engine::general_purpose::STANDARD.encode(content),
