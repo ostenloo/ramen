@@ -111,7 +111,7 @@ fatal protocol violation.
 {
   "v": 1,
   "type": "Hello",
-  "token": "<base64url, no padding — serialized Biscuit>",
+  "token": "c2VyaWFsaXplZEJpc2N1aXQ",
   "client": { "name": "ramenctl", "version": "0.1.0" }
 }
 ```
@@ -129,7 +129,7 @@ construction can never influence a decision does not warrant a fatal response.
 {
   "v": 1,
   "type": "Welcome",
-  "session": "01J8Z...",
+  "session": "01J8ZQ5N2P4R6S8T0V2W4X6Y0A",
   "identity": "agent:planner",
   "capabilities": [
     { "op": "Whoami", "reversibility": "Trivial" },
@@ -155,7 +155,7 @@ carries an id — cannot be used here.)
 ```json
 {
   "v": 1,
-  "id": "01J8ZQ...",
+  "id": "01J8ZQ3K9X2M0W4Y5A6B7C8D9E",
   "op": { "type": "Whoami" }
 }
 ```
@@ -214,9 +214,9 @@ compile time — which is the point.
 Three terminal statuses, tagged on `status`:
 
 ```json
-{ "v": 1, "id": "01J8ZQ...", "status": "Ok",     "result": { ... } }
-{ "v": 1, "id": "01J8ZQ...", "status": "Denied", "denial": { ... } }
-{ "v": 1, "id": "01J8ZQ...", "status": "Error",  "error": { ... } }
+{ "v": 1, "id": "01J8ZQ3K9X2M0W4Y5A6B7C8D9E", "status": "Ok", "result": { "identity": "agent:planner", "session": "01J8ZQ5N2P4R6S8T0V2W4X6Y0A", "capabilities": [ { "op": "Whoami", "reversibility": "Trivial" } ], "token_expires_at": null } }
+{ "v": 1, "id": "01J8ZQ3K9X2M0W4Y5A6B7C8D9E", "status": "Denied", "denial": { "code": "CapabilityNotGranted", "reason": "token grants no FileWrite capability", "audit_seq": 1041 } }
+{ "v": 1, "id": "01J8ZQ3K9X2M0W4Y5A6B7C8D9E", "status": "Error", "error": { "code": "NotImplemented", "message": "operation not available in v0" } }
 ```
 
 All three are terminal for that request id. There is no non-terminal status in
@@ -264,7 +264,7 @@ disk failure).
 ```json
 {
   "v": 1,
-  "id": "01J8ZQ...",
+  "id": "01J8ZQ7T4V6X8Z0B2D4F6H8J0K",
   "status": "Denied",
   "denial": {
     "code": "CapabilityNotGranted",
@@ -291,7 +291,7 @@ Denial codes (closed set; add variants deliberately):
 ```json
 {
   "v": 1,
-  "id": "01J8ZQ...",
+  "id": "01J8ZQ9W2Y4A6C8E0G2K4M6N8P",
   "status": "Error",
   "error": { "code": "NotImplemented", "message": "operation not available in v0" }
 }
