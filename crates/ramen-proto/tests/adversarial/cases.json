@@ -1,0 +1,19 @@
+{
+  "cases": [
+    { "file": "unknown_envelope_type.json", "expect": "reject" },
+    { "file": "fault_with_id.json", "expect": "reject" },
+    { "file": "unknown_response_status.json", "expect": "reject" },
+    { "file": "response_missing_id.json", "expect": "reject" },
+    { "file": "request_short_id.json", "expect": "reject" },
+    { "file": "unknown_operation_type.json", "expect": "reject" },
+    { "file": "unknown_field_envelope.json", "expect": "reject" },
+    { "file": "unknown_field_operation.json", "expect": "reject" },
+    { "file": "unknown_field_error.json", "expect": "reject" },
+    { "file": "duplicate_key.json", "expect": "reject" },
+    { "file": "not_json.bin", "expect": "reject" },
+    { "file": "not_utf8.bin", "expect": "reject" },
+    { "file": "valid_whoami_max_crockford_id.json", "expect": "accept" },
+    { "file": "valid_filewrite_empty_content.json", "expect": "accept" },
+    { "file": "valid_denied_zero_seq.json", "expect": "accept" }
+  ]
+}

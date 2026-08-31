@@ -19,7 +19,7 @@ pub use wire::codec::{encode, Decoder, WireError, MAX_FRAME_BYTES};
 pub use wire::{
     CapabilitySummary, ClientInfo, Constraints, DenialCode, ErrorCode, Fault,
     FileWriteOp, Hello, Message, Operation, Reversibility, Request, RequestId,
-    Response, SessionId, WriteMode, PROTOCOL_VERSION,
+    Response, SessionId, WhoamiOp, WriteMode, PROTOCOL_VERSION,
 };
 
 use std::collections::HashMap;

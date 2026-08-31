@@ -148,9 +148,18 @@ pub enum WriteMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", deny_unknown_fields)]
 pub enum Operation {
-    Whoami,
+    Whoami(WhoamiOp),
     FileWrite(FileWriteOp),
 }
+
+/// The `Whoami` operation carries no fields. An *empty* struct (not a unit
+/// variant): an internally-tagged unit variant silently accepts unknown
+/// fields (serde drops them), which would violate the protocol's
+/// unknown-fields rule (`01-protocol.md` §6). The wrapper is what makes
+/// `deny_unknown_fields` apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WhoamiOp {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -23,7 +23,7 @@ use std::process::ExitCode;
 use base64::Engine;
 use biscuit_auth::UnverifiedBiscuit;
 use clap::{Parser, Subcommand};
-use ramen_sdk::{Client, Operation, OpOutcome, WriteMode};
+use ramen_sdk::{Client, Operation, OpOutcome, WhoamiOp, WriteMode};
 use serde_json::json;
 
 #[derive(Parser)]
@@ -149,7 +149,7 @@ async fn dispatch(args: &Args, token: &UnverifiedBiscuit) -> ExitCode {
                 Err(e) => protocol_failure(args, &e.to_string()),
             }
         }
-        Command::Whoami => run_call(args, token, Operation::Whoami, |outcome| {
+        Command::Whoami => run_call(args, token, Operation::Whoami(WhoamiOp {}), |outcome| {
             match outcome {
                 OpOutcome::Ok(result) => {
                     if args.json {

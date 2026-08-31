@@ -35,7 +35,7 @@ async fn handshake_exposes_session_and_identity() {
     assert_eq!(client.identity(), "agent:planner");
     assert!(client.session().0 != ulid::Ulid::nil(), "session id must be set");
 
-    let out = client.call(Operation::Whoami).await.unwrap();
+    let out = client.call(Operation::Whoami(ramen_sdk::WhoamiOp {})).await.unwrap();
     match out {
         OpOutcome::Ok(result) => {
             assert_eq!(result["identity"], "agent:planner");
