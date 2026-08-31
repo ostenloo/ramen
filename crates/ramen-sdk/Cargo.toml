@@ -1,0 +1,28 @@
+[package]
+name = "ramen-sdk"
+description = "Ramen client library: independent implementation of the 01-protocol.md wire protocol"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+# preserve_order: `OpOutcome::Ok(serde_json::Value)` passes the op result
+# through untouched; the golden round-trip must reproduce the fixture's key
+# order, so parsed values must retain insertion order.
+serde_json = { workspace = true, features = ["preserve_order"] }
+thiserror.workspace = true
+ulid.workspace = true
+biscuit-auth = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util", "sync", "rt"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+base64 = { workspace = true }
+libc = { workspace = true }
+# Test-only: the client tests spawn a real supervisor and pin the test
+# binary's own code-signing identifier in the supervisor's `[peer]
+# requirement` (the same arrangement the supervisor's own test harness uses).
+# The SDK library itself depends on neither.
+ramen-supervisor = { path = "../ramen-supervisor" }
+ramen-audit = { path = "../ramen-audit" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

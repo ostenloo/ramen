@@ -1,0 +1,334 @@
+//! `ramen-sdk`: the Ramen client library.
+//!
+//! This crate is an **independent implementation** of the wire protocol
+//! defined by `01-protocol.md`. It shares no code with `ramen-proto`;
+//! the two are reconciled only by the golden-fixture round-trip tests
+//! (`tests/golden.rs`). This independence is deliberate (spec
+//! 06-ramenctl.md §1): the SDK is the instrument that proves the spec is
+//! self-sufficient.
+//!
+//! # Transport scope
+//!
+//! `SdkError` covers transport, framing, and handshake failures only.
+//! Denials and protocol-level `Error` responses are *outcomes* of a
+//! successful round-trip and surface in [`OpOutcome`].
+
+mod wire;
+
+pub use wire::codec::{encode, Decoder, WireError, MAX_FRAME_BYTES};
+pub use wire::{
+    CapabilitySummary, ClientInfo, Constraints, DenialCode, ErrorCode, Fault,
+    FileWriteOp, Hello, Message, Operation, Reversibility, Request, RequestId,
+    Response, SessionId, WriteMode, PROTOCOL_VERSION,
+};
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use biscuit_auth::UnverifiedBiscuit;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::unix::OwnedReadHalf;
+use tokio::net::UnixStream;
+use tokio::sync::{mpsc, oneshot};
+
+/// Errors for transport, framing, and handshake failures only (spec §8:
+/// these are the SDK's `SdkError`).
+#[derive(Debug, thiserror::Error)]
+pub enum SdkError {
+    #[error("transport: {0}")]
+    Transport(#[source] std::io::Error),
+    #[error("framing: {0}")]
+    Framing(#[from] WireError),
+    #[error("token could not be serialized: {0}")]
+    Token(String),
+    /// Supervisor answered the handshake with a terminal `Error` envelope.
+    #[error("handshake rejected: {code:?}: {message}")]
+    Handshake { code: ErrorCode, message: String },
+    /// The connection closed before a `Welcome` arrived.
+    #[error("connection closed before handshake")]
+    HandshakeClosed,
+    /// EOF or peer failure while an operation was in flight (or at send).
+    #[error("connection closed")]
+    ConnectionClosed,
+    /// The supervisor sent a message that is not legal at this point.
+    #[error("protocol violation: {0}")]
+    ProtocolViolation(String),
+    /// The supervisor sent a best-effort `Fault` and closed the connection.
+    #[error("fault from supervisor: {code:?}: {message}")]
+    Fault { code: ErrorCode, message: String },
+}
+
+/// Terminal outcome of an operation (spec 06-ramenctl.md §2).
+///
+/// `Ok` carries the op-specific result as JSON. `Error` (added by the M7
+/// spec amendment — see the M7 commit) carries a protocol-level machinery
+/// failure from the supervisor; it is an outcome, not an SDK error, because
+/// the round-trip itself succeeded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpOutcome {
+    Ok(serde_json::Value),
+    Denied {
+        code: DenialCode,
+        reason: String,
+        audit_seq: u64,
+    },
+    Error {
+        code: ErrorCode,
+        message: String,
+    },
+}
+
+struct InFlight {
+    tx: oneshot::Sender<Result<OpOutcome, SdkError>>,
+}
+
+/// A connected, authenticated Ramen client (spec 06-ramenctl.md §2).
+///
+/// One `Client` serves concurrent calls: requests are serialized on a
+/// single writer task and responses are matched to callers by request ID on
+/// the reader task. `Client` is `Send + Sync`; `call` takes `&self`.
+pub struct Client {
+    session: SessionId,
+    identity: String,
+    out: mpsc::Sender<Vec<u8>>,
+    pending: Arc<Mutex<HashMap<RequestId, InFlight>>>,
+}
+
+impl Client {
+    /// Connect to the supervisor socket, send `Hello`, and wait for
+    /// `Welcome`.
+    ///
+    /// The token is passed as an `UnverifiedBiscuit` (M7 amendment to the
+    /// spec's `&Biscuit`): a client cannot hold a *verified* biscuit, since
+    /// verification requires the root public key, which only the supervisor
+    /// and the minter hold (04-guard.md §3).
+    pub async fn connect(
+        socket: &Path,
+        token: &UnverifiedBiscuit,
+    ) -> Result<Self, SdkError> {
+        let token_b64 = token
+            .to_base64()
+            .map_err(|e| SdkError::Token(e.to_string()))?;
+
+        let client_info = ClientInfo::new("ramen-sdk", env!("CARGO_PKG_VERSION"));
+
+        let stream =
+            UnixStream::connect(socket).await.map_err(SdkError::Transport)?;
+        let (read, write) = stream.into_split();
+
+        let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(64);
+        tokio::spawn(async move {
+            let mut w = write;
+            while let Some(frame) = out_rx.recv().await {
+                if w.write_all(&frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Handshake: Hello, then wait for Welcome.
+        let hello = Message::Hello(Hello::new(token_b64, client_info));
+        let mut frame = Vec::new();
+        encode(&hello, &mut frame).map_err(SdkError::Framing)?;
+        out_tx
+            .send(frame)
+            .await
+            .map_err(|_| SdkError::ConnectionClosed)?;
+
+        let mut dec = Decoder::new();
+        let mut buf = vec![0u8; 8192];
+        let mut rd = read;
+        let welcome = loop {
+            match rd.read(&mut buf).await {
+                Ok(0) => return Err(SdkError::HandshakeClosed),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(SdkError::Transport(e)),
+                Ok(n) => {
+                    dec.feed(&buf[..n]).map_err(SdkError::Framing)?;
+                    if let Some(f) = dec.next_frame().map_err(SdkError::Framing)? {
+                        match Message::from_bytes(&f).map_err(SdkError::Framing)? {
+                            Message::Welcome(w) => break w,
+                            Message::Response(Response::Error { error, .. }) => {
+                                return Err(SdkError::Handshake {
+                                    code: error.code,
+                                    message: error.message,
+                                });
+                            }
+                            other => {
+                                return Err(SdkError::ProtocolViolation(
+                                    format!("expected Welcome first, got {other:?}"),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        tokio::spawn(reader_task(rd, pending.clone()));
+
+        Ok(Self {
+            session: welcome.session,
+            identity: welcome.identity,
+            out: out_tx,
+            pending,
+        })
+    }
+
+    /// Session ID from the `Welcome`.
+    pub fn session(&self) -> SessionId {
+        self.session
+    }
+
+    /// Identity derived from the token claims (same in `Welcome` and in the
+    /// live `Whoami` result).
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    /// Issue an operation and await its terminal outcome.
+    ///
+    /// v0 has exactly three terminal statuses; the round-trip resolves when
+    /// the supervisor's terminal response for this request ID arrives
+    /// (responses are matched by ID, never by order).
+    pub async fn call(&self, op: Operation) -> Result<OpOutcome, SdkError> {
+        let id = RequestId::new();
+        let req = Message::Request(Request::new(id, op));
+        let mut frame = Vec::new();
+        encode(&req, &mut frame).map_err(SdkError::Framing)?;
+
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().unwrap().insert(
+            id,
+            InFlight {
+                tx,
+            },
+        );
+
+        if self.out.send(frame).await.is_err() {
+            self.pending.lock().unwrap().remove(&id);
+            return Err(SdkError::ConnectionClosed);
+        }
+
+        match rx.await {
+            Ok(Ok(outcome)) => Ok(outcome),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(SdkError::ConnectionClosed),
+        }
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        // Dropping the sender ends the writer task, which drops the write
+        // half; the supervisor sees EOF and the reader fails any pending
+        // calls with ConnectionClosed.
+    }
+}
+
+/// Fail every in-flight call (used on EOF, framing death, and `Fault`).
+fn fail_all(
+    pending: &Arc<Mutex<HashMap<RequestId, InFlight>>>,
+    make_err: impl Fn() -> SdkError,
+) {
+    for (_, in_flight) in pending.lock().unwrap().drain() {
+        let _ = in_flight.tx.send(Err(make_err()));
+    }
+}
+
+async fn reader_task(
+    mut rd: OwnedReadHalf,
+    pending: Arc<Mutex<HashMap<RequestId, InFlight>>>,
+) {
+    let mut dec = Decoder::new();
+    let mut buf = vec![0u8; 8192];
+    let mut dead = false;
+    loop {
+        match rd.read(&mut buf).await {
+            Ok(0) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+            Ok(n) => {
+                if let Err(e) = dec.feed(&buf[..n]) {
+                    fail_all(&pending, || SdkError::Framing(e.clone()));
+                    dead = true;
+                    break;
+                }
+                'frames: while let Some(frame) = dec.next_frame().unwrap() {
+                    match Message::from_bytes(&frame) {
+                        Err(e) => {
+                            fail_all(&pending, || SdkError::Framing(e.clone()));
+                            dead = true;
+                            break 'frames;
+                        }
+                        Ok(Message::Response(r)) => handle_response(&pending, r),
+                        Ok(Message::Fault(f)) => {
+                            fail_all(
+                                &pending,
+                                || SdkError::Fault {
+                                    code: f.error.code,
+                                    message: f.error.message.clone(),
+                                },
+                            );
+                            dead = true;
+                            break 'frames;
+                        }
+                        Ok(other) => {
+                            fail_all(
+                                &pending,
+                                || SdkError::ProtocolViolation(format!(
+                                    "unexpected message after handshake: {other:?}"
+                                )),
+                            );
+                            dead = true;
+                            break 'frames;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !dead {
+        fail_all(&pending, || SdkError::ConnectionClosed);
+    }
+}
+
+fn handle_response(
+    pending: &Arc<Mutex<HashMap<RequestId, InFlight>>>,
+    r: Response,
+) {
+    match r {
+        Response::Ok { id, result, .. } => resolve(pending, id, OpOutcome::Ok(result)),
+        Response::Denied { id, denial, .. } => resolve(
+            pending,
+            id,
+            OpOutcome::Denied {
+                code: denial.code,
+                reason: denial.reason,
+                audit_seq: denial.audit_seq,
+            },
+        ),
+        Response::Error { id, error, .. } => resolve(
+            pending,
+            id,
+            OpOutcome::Error {
+                code: error.code,
+                message: error.message,
+            },
+        ),
+    }
+}
+
+fn resolve(
+    pending: &Arc<Mutex<HashMap<RequestId, InFlight>>>,
+    id: RequestId,
+    outcome: OpOutcome,
+) {
+    if let Some(in_flight) = pending.lock().unwrap().remove(&id) {
+        let _ = in_flight.tx.send(Ok(outcome));
+    }
+    // An unknown ID is protocol-illegal from the supervisor; ignore
+    // defensively rather than tear down the connection.
+}
