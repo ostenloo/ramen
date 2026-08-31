@@ -1,0 +1,38 @@
+name: ci
+
+# macOS-only by construction: the supervisor exercises fclonefileat(2),
+# clonefile(2), LC_UUID/Security.framework peer identity, and APFS
+# same-volume semantics. Linux runners cannot run this suite.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace
+
+  clippy:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # The spec's illustrative JSON examples must remain legal wire frames for
+  # both implementations. This is the permanent guard for the defect class
+  # "an example contradicts the normative text next to it" — two sweeps
+  # found two instances before this test existed. Run as its own job so a
+  # spec edit that reopens the class fails CI on a check named for it.
+  spec-examples:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p ramen-proto -p ramen-sdk --test spec_examples

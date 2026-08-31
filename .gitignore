@@ -1,3 +1,12 @@
-.*
-!.gitignore
+# Editor and OS noise
+.DS_Store
+.env
+.idea/
+.vscode/
+
+# Working copy of the spec for review (kept out of version control on
+# purpose: it is a scratch mirror of spec/)
+.temp/
+
+# Build output
 target/
