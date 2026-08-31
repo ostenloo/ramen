@@ -729,13 +729,15 @@ fn symlink_swap_during_window_cannot_steer_the_write() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    // Swap the target's parent: move the real directory aside (still inside
-    // the configured prefix) and plant a symlink at the same path pointing
-    // at the decoy directory. Every path-string re-resolution of
-    // `<prefix>/a/f.txt` from now on lands in `b/`.
+    // Swap the target's parent: move the real directory aside and plant a
+    // symlink at the same path pointing at the *decoy* directory `b/`. Every
+    // path-string re-resolution of `<prefix>/a/f.txt` from now on lands in
+    // `b/`. The pin (already done — see the `Authorized` poll above) must
+    // keep the write in the real directory; an implementation that
+    // re-resolves the path at write time would write into `b/` instead.
     let a_real = dir.join("a-real");
     std::fs::rename(&a, &a_real).unwrap();
-    std::os::unix::fs::symlink(&a_real, &a).unwrap();
+    std::os::unix::fs::symlink(&b, &a).unwrap();
 
     // The effect (after the 5-second window) must write through the pin.
     let resp = match client.recv() {
