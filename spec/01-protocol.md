@@ -263,6 +263,8 @@ disk failure).
 
 ```json
 {
+  "v": 1,
+  "id": "01J8ZQ...",
   "status": "Denied",
   "denial": {
     "code": "CapabilityNotGranted",
@@ -288,6 +290,8 @@ Denial codes (closed set; add variants deliberately):
 
 ```json
 {
+  "v": 1,
+  "id": "01J8ZQ...",
   "status": "Error",
   "error": { "code": "NotImplemented", "message": "operation not available in v0" }
 }
