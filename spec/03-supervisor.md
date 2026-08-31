@@ -30,7 +30,15 @@ stderr. There is no partial start.
 
 The supervisor does not daemonize itself, does not write a pidfile, and does not
 manage its own restarts. It runs in the foreground under `launchd`. Process
-supervision is a solved problem owned by the platform.
+supervision is a solved problem owned by the platform. The LaunchAgent plist is
+a deployment artifact outside this repository, but the supervisor's
+fail-exit-on-audit-failure design (`00-overview.md` invariant 4) only works
+if the restart is visible and does not spin: the plist must restart the
+process on nonzero exit (e.g. `KeepAlive` with `SuccessfulExit = false`), and
+launchd's throttle (`ThrottleInterval`, default 10s) bounds the crash loop a
+permanently unwritable audit log produces to a visible tick rather than a
+spin. A plist that suppresses restarts on nonzero exit makes a dead supervisor
+look alive in `launchctl`.
 
 ## 2. Configuration
 

@@ -192,7 +192,14 @@ Order is load-bearing. Do not rearrange for convenience.
    a clone of the opened file, so it captures the content of the file that
    was authorized, whatever the path string comes to refer to afterwards. The
    snapshot file is created `0600` explicitly (not `umask`-dependent): it is a
-   pre-image of content the agent wrote.
+   pre-image of content the agent wrote. `fclonefileat` creates the destination
+   with the *source's* mode, so between the clone and the `0600` chmod there is
+   a transient window in which a world-readable source leaves a same-uid-
+   readable copy of the pre-image on disk. The window is bounded to same-uid
+   processes because the state directory is `0700` (§2): a cross-uid reader
+   needs directory traversal first, which the state dir denies. The `0700` is
+   therefore load-bearing for the snapshot files, not merely defense in depth
+   for the directory itself.
    `snapshot_path` is
    `<state_dir>/snapshots/<session_id>.<request_id>.<sanitized_basename>`.
    The session id is supervisor-generated, so uniqueness does not depend on the
