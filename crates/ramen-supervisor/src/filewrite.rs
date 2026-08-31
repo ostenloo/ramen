@@ -208,6 +208,14 @@ fn execute_overwrite(
     // Explicit 0600: the snapshot holds the pre-image of agent-written
     // content. The state directory is 0700 (defense in depth), but the file
     // mode is stated, not inherited from the source.
+    //
+    // Known, accepted window: `fclonefileat` creates the destination with the
+    // source's mode, so between the clone and this chmod a 0644 source leaves
+    // a world-*readable-by-uid* copy on disk. The 0700 state directory bounds
+    // it to same-uid processes; a cross-uid reader needs directory traversal
+    // first, which the state dir denies. Closing the window would require a
+    // mode-0600 destination (create-then-rename), which `clonefile` does not
+    // support.
     if let Err(e) = std::fs::set_permissions(&snapshot_path, std::fs::Permissions::from_mode(0o600)) {
         tracing::warn!("snapshot chmod 0600 failed (state dir is 0700): {e}");
     }
