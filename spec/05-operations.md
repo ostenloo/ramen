@@ -54,6 +54,14 @@ This is the guard's view of the token, recomputed at call time — not the cache
 `Welcome` summary. Recomputing matters: it means `Whoami` reflects the authorizer
 as it currently evaluates, which is what makes it useful for debugging a denial.
 
+The capability list is a **summary of the token's facts** (the `capability`,
+`allowed_prefix`, and `reversibility_allowed` predicates), not a re-evaluation
+of the full policy for a hypothetical request. It answers "what does this token
+claim to grant," for humans and debug tools. The authoritative answer to "may
+this caller do X" is the per-request decision from `authorize`, and the two are
+computed separately: a policy change could make them disagree, and that is by
+design. The list must never be treated as a promise.
+
 `Whoami` reports **only** the caller's own token. It exposes nothing about the
 supervisor's configuration, other sessions, the root key, or the audit log.
 Introspection endpoints are a common route to leaking the enforcement boundary's
@@ -150,48 +158,81 @@ Order is load-bearing. Do not rearrange for convenience.
    no audit `Authorized` record. Decode before the authorized record so a
    malformed request does not produce a recorded intent that never had a chance
    of executing.
-3. Append audit `Authorized`, including `snapshot_path` and the SHA-256 of the
+3. **Pin the target's parent directory**: open the canonical parent with
+   `O_RDONLY | O_DIRECTORY | O_NOFOLLOW` and verify the opened descriptor *is*
+   that directory — a stat before and after the open must agree on device +
+   inode, and the post-open stat must be a directory. Every effect syscall
+   from here on — snapshot, temp open, write, rename — runs **at-relative to
+   that descriptor** (`openat`, `fclonefileat`, `renameat`, `unlinkat`), never
+   against the path string. Resolving the path string per syscall would
+   re-resolve it independently every time, and each re-resolution is a window
+   in which an agent with write access to an intermediate directory can swap a
+   path component (move the real directory aside and plant a symlink at the
+   same path) and steer the write into a different directory — possibly
+   outside the configured prefixes. The pin makes the next bound hold against
+   the directory that is actually written. If the parent cannot be opened or
+   verified, the effect fails: `Authorized` is audited first, then
+   `ExecutionFailed` (the decision was made; the effect cannot run).
+
+   The supervisor also enforces its own **outer bound**: the pinned canonical
+   target (not a fresh path lookup) must fall within a configured allowed
+   prefix. The token's `allowed_prefix` facts are the capability grant; this is
+   the outer bound the supervisor itself enforces. If it is violated the
+   request is `Denied` (`ConstraintViolated`), audited, and no `Authorized`
+   record is written.
+4. Append audit `Authorized`, including `snapshot_path` and the SHA-256 of the
    content to be written. Durable before proceeding (invariant 2). The snapshot
    path is deterministic (below), so it can be recorded before the snapshot
    exists. **The snapshot is a state mutation and invariant 2 covers it: the
    audit must precede it, and a crash between audit and snapshot is visible as
    an `Authorized` with no terminal record.**
-4. Take the snapshot (`Overwrite` only):
-   ```
-   clonefile(canonical_path, snapshot_path, 0)
-   ```
+5. Take the snapshot (`Overwrite` only): open the target through the pin
+   (`openat` `O_RDONLY | O_NOFOLLOW`; it must be a regular file), then
+   `fclonefileat(target_fd, snapshots_dir_fd, snapshot_name)`. The snapshot is
+   a clone of the opened file, so it captures the content of the file that
+   was authorized, whatever the path string comes to refer to afterwards. The
+   snapshot file is created `0600` explicitly (not `umask`-dependent): it is a
+   pre-image of content the agent wrote.
    `snapshot_path` is
    `<state_dir>/snapshots/<session_id>.<request_id>.<sanitized_basename>`.
    The session id is supervisor-generated, so uniqueness does not depend on the
    client at all (`01-protocol.md` §3 does not guarantee cross-connection
    uniqueness of request ids). The basename is sanitized to
    `[A-Za-z0-9._-]`, truncated to 64 bytes, and is a human-readable suffix
-   only. `clonefile` requires the destination not to exist; the naming scheme
+   only. The clone requires the destination not to exist; the naming scheme
    makes collision impossible.
    Failure → `Error/ExecutionFailed`, audit `ExecutionFailed`, **no write is
-   attempted**.
-5. Write, with the mechanism split by mode:
-   - `Create`: `open(canonical_path, O_WRONLY|O_CREAT|O_EXCL, 0644)`, write,
-     `fsync` the file, `fsync` the directory. The kernel provides the atomic
-     "fail if exists". A crash mid-`Create` leaves a partial new file — that is
-     acceptable because there is no prior content: `Authorized` with no
+   attempted**. If the target is on a different volume than the state
+   directory, the clone fails with `EXDEV`; the supervisor maps this to a
+   stable `Error/ExecutionFailed` message — never a raw errno — so the client
+   learns what to fix (a prefix created or mounted on another volume after
+   startup is the realistic case; startup verification only covers what
+   exists then).
+6. Write, with the mechanism split by mode; every syscall is at-relative to
+   the pinned directory fd:
+   - `Create`: `openat(dirfd, name, O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW, 0644)`,
+     write, `fsync` the file, `fsync` the directory. The kernel provides the
+     atomic "fail if exists". A crash mid-`Create` leaves a partial new file —
+     that is acceptable because there is no prior content: `Authorized` with no
      `Executed` fully describes it, and deleting the file is a complete
      recovery.
-   - `Overwrite`: create a temp file in the same directory, write, `fsync` the
-     file, `rename` over the target, `fsync` the directory. The atomic-rename
-     pattern means a crash mid-write leaves either the old file or the new one,
-     never a truncated one.
-6. Append audit `Executed` with bytes written and the restore handle.
+   - `Overwrite`: create a temp file in the pinned directory, write, `fsync`
+     the file, `renameat` over the target, `fsync` the directory. The
+     atomic-rename pattern means a crash mid-write leaves either the old file
+     or the new one, never a truncated one.
+7. Append audit `Executed` with bytes written and the restore handle.
 
-If step 5 fails after step 4, the log shows `Authorized` followed by
+If step 6 fails after step 5, the log shows `Authorized` followed by
 `ExecutionFailed` and the snapshot remains. That is the correct observable
 state.
 
 **Documented race.** `Overwrite` can silently create if the target is deleted
-between the snapshot (step 4) and the rename (step 5). In practice step 4
-catches it — `clonefile` on a nonexistent source fails — and the residual
-window is narrow; the outcome (a file inside the allowed prefix holding
-authorized content) remains within the grant. This is documented, not hidden.
+between the open (step 5) and the rename (step 6): the snapshot was taken
+through the still-open file, so the pre-image is intact, and the rename
+re-creates a new file at the target path holding authorized content. The
+residual window is narrow; the outcome (a file inside the allowed prefix
+holding authorized content, with a recoverable pre-image) remains within the
+grant. This is documented, not hidden.
 
 ### On APFS and `clonefile`
 
@@ -210,6 +251,11 @@ cross volumes. Verify at startup that the state directory and the configured
 allowed prefixes share a device id, and refuse otherwise. This is a real
 constraint that will be hit by anyone whose work directory is on an external
 disk, and discovering it at first write is much worse than at startup.
+
+The state directory and its `snapshots/` subdirectory are created — or
+verified — `0700` at startup: they hold pre-images of agent-written content
+and, next door, the audit chain, and nothing outside the supervisor's user
+should be able to read or tamper with them.
 
 ### Response
 

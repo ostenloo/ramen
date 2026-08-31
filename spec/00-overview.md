@@ -48,12 +48,18 @@ regardless of what it enables.
 
 4. **No silent degradation.** If the supervisor cannot enforce — audit log
    unwritable, root key unavailable, peer identity unverifiable — it refuses
-   service. It never continues in a reduced-enforcement mode. Failure is loud
-   and terminal for the affected connection.
+   service. It never continues in a reduced-enforcement mode. The refusal is
+   at the level the failure affects: peer identity is per-connection, so an
+   unverifiable peer gets its connection refused and the rest of the system
+   keeps running; the audit log is process-wide, so if it dies mid-run the
+   supervisor **exits** with a fatal code (`EXIT_AUDIT_UNAVAILABLE` = 4) —
+   a live process with a dead audit writer is a reduced-enforcement mode in
+   which every subsequent effect would violate invariant 2. Failure is loud.
 
 5. **The control plane is not an operable surface.** No operation exposed over
    the protocol can read, write, or influence the supervisor's own
-   configuration, audit log, key material, or socket. This is enforced by not
+   configuration, audit log, key material, state directory (including
+   snapshots), or socket. This is enforced by not
    implementing such operations, and by path checks in the ones that touch the
    filesystem.
 

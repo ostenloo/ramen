@@ -17,6 +17,12 @@
 
 #![deny(unsafe_code)]
 
+/// Process exit code when the audit log can no longer be written
+/// (`00-overview.md` invariant 4). A supervisor that cannot audit cannot
+/// enforce, so it exits instead of degrading. Startup failures and usage
+/// errors both use exit code `1`.
+pub const EXIT_AUDIT_UNAVAILABLE: i32 = 4;
+
 #[cfg(not(target_os = "macos"))]
 compile_error!(
     "ramen-supervisor requires macOS: peer identity uses AF_UNIX LOCAL_PEERTOKEN \

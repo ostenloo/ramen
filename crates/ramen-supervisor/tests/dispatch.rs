@@ -476,3 +476,57 @@ fn in_flight_cap_is_non_fatal() {
     drop(client);
     sup.terminate_and_wait();
 }
+
+// ---------------------------------------------------------------------------
+// Invariant 4, fail-exit form: a dead audit writer is a process fatal, not a
+// per-request refusal. `RAMEN_TEST_AUDIT_FAIL_AFTER=2` makes the second
+// append (the Whoami `Authorized`) fail; the supervisor must exit with
+// `EXIT_AUDIT_UNAVAILABLE` instead of answering `Error/AuditUnavailable`,
+// and the chain must remain valid up to the last durable record.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn audit_failure_is_process_fatal_not_per_request_refusal() {
+    let fx = common::Fixture::new();
+    let requirement = format!("identifier \"{}\"", common::test_binary_identifier());
+    let body = fx.parts.body(&requirement);
+    let mut sup = common::Supervisor::start_with_body_env(
+        &fx,
+        &body,
+        &[("RAMEN_TEST_AUDIT_FAIL_AFTER", "2")],
+    );
+
+    let token = sup.token("agent:audit", &["Whoami"]);
+    let mut client = common::Client::connect(&sup.socket);
+    // Append 1 (SessionOpened) succeeds: the handshake completes.
+    client.hello(&token);
+
+    // Append 2 (Whoami `Authorized`) is simulated to fail.
+    client.send(&Message::Request(Request::new(WHOAMI)));
+
+    // The process exits on its own with the fatal audit code...
+    let status = sup.wait_exit();
+    assert_eq!(
+        status.code(),
+        Some(ramen_supervisor::EXIT_AUDIT_UNAVAILABLE),
+        "invariant 4: a dead audit writer must exit the process, not degrade"
+    );
+    // ...and the client sees a closed connection, not a response.
+    assert!(client.recv().is_none(), "no response may be sent once the audit writer is dead");
+
+    // The chain is still valid: the SessionOpened record is durable and the
+    // un-audited request left no dangling Authorized.
+    common::assert_chain_valid(&sup.audit);
+    let records = sup.audit_records();
+    assert!(
+        records.iter().any(|r| matches!(r, Record::Event(e)
+            if e.kind == RecordKind::SessionOpened
+                && e.identity.as_deref() == Some("agent:audit"))),
+        "the SessionOpened record (append 1) must be durable"
+    );
+    assert!(
+        !records.iter().any(|r| matches!(r, Record::Event(e)
+            if e.kind == RecordKind::Authorized)),
+        "no Authorized record may exist for the un-auditable request"
+    );
+}

@@ -86,10 +86,17 @@ or the full 64-hex form) all fail `SecCodeCheckValidity` against that same
 binary, and the toolchain offers no way to produce SHA-1 signatures. `identifier`
 pinning is therefore the CI form. It is weaker than a content pin (any local
 process can ad-hoc sign with the same identifier), which is acceptable in the
-v0 single-user trust model: the socket is `0600` and the root key is readable
-only by the same user, so a same-user attacker could mint tokens anyway. The
-cdhash (truncated SHA-256) is still extracted and recorded in the audit trail
-for forensics.
+v0 single-user trust model: everything the supervisor protects is local to one
+user. The socket is `0600`, and the sensitive material — the minter's
+*private* key and the minted token files — is readable only by the same user.
+(Note the supervisor's `root_key_path` is the *public* key: being able to read
+it grants nothing, only the minter's private key can mint.) A same-user
+attacker can therefore mint tokens, read existing ones, and reach the socket;
+the supervisor's checks do not defend against that attacker and are not
+claimed to. They exist to make cross-user and cross-process misuse of the
+socket impossible, and to keep the audit log meaningful. The cdhash
+(truncated SHA-256) is still extracted and recorded in the audit trail for
+forensics.
 
 There is **no development bypass flag.** An earlier draft of this spec had
 `require_valid_signature = false`; it is deleted. A flag that downgrades the
@@ -200,6 +207,15 @@ guard decision may be relaxed on the basis of a good signature.
 This distinction is worth a comment in the source, because the natural next
 thought when peer verification is working is "we can trust this caller now,"
 and that thought is the beginning of ambient authority.
+
+**There is no token-to-identity binding in v0.** The peer requirement decides
+which *binary* may connect; the token decides what a connection may do. These
+are independent axes, and v0 deliberately does not join them: nothing in the
+handshake checks that the token was minted *for* the connecting binary. Any
+process whose binary satisfies the requirement can use any token it can read.
+That is acceptable in the single-user model below — a same-user attacker can
+mint its own tokens anyway — but it means "verified peer" must never be read
+as "verified agent".
 
 ### Module layout
 

@@ -162,11 +162,18 @@ pub struct Request {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(tag = "type")]
+#[serde(tag = "type", deny_unknown_fields)]
 pub enum Operation {
-    Whoami,
+    Whoami(WhoamiOp),
     FileWrite(FileWriteOp),
 }
+
+// An *empty* struct, not a unit variant: an internally-tagged unit variant
+// silently accepts unknown fields (serde drops them), which would violate the
+// rule below. Wrapping the payload is what makes `deny_unknown_fields` apply.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WhoamiOp {}
 ```
 
 Use `#[serde(deny_unknown_fields)]` on every request-side struct. An unknown
@@ -282,6 +289,21 @@ Denial codes (closed set; add variants deliberately):
 
 Error codes: `VersionMismatch`, `MalformedRequest`, `NotImplemented`,
 `IdentityUnverifiable`, `AuditUnavailable`, `ExecutionFailed`, `Internal`.
+
+**The code sets are closed, per protocol version.** Both the denial codes
+and the error codes are closed sets for v0: the lists above are normative, and
+a conforming client rejects a frame carrying an unrecognized code exactly as
+it rejects an unrecognized envelope `type` or response status (a transport
+error). A new code is a protocol change and ships with a new `v`; because the
+version is validated before the body is parsed (§3, §8), a conforming client
+never has to parse an unknown code. Do not extend a set within a version —
+that is what a version bump is for.
+
+`AuditUnavailable` is unreachable from a v0 supervisor: an audit failure is a
+process fatal (`00-overview.md` invariant 4), so a client whose audit-append
+just failed sees a closed connection, not this code. The code stays in the set
+so a client built against this version remains forward-compatible with a
+supervisor that might one day answer rather than exit.
 
 **`message` must never contain data derived from the operation's target
 contents.** It may name a path the client already supplied; it must not contain

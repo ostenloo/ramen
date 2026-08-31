@@ -328,6 +328,12 @@ impl Supervisor {
         self.child.wait().unwrap()
     }
 
+    /// Wait for the supervisor to exit on its own (e.g. the invariant-4
+    /// fatal audit failure, `EXIT_AUDIT_UNAVAILABLE`) and return the status.
+    pub fn wait_exit(&mut self) -> std::process::ExitStatus {
+        self.child.wait().unwrap()
+    }
+
     /// All audit records currently in the log file.
     pub fn audit_records(&self) -> Vec<Record> {
         read_audit_records(&self.audit)

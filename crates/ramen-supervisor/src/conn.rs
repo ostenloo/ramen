@@ -19,12 +19,13 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use base64::Engine;
 use biscuit_auth::PublicKey;
-use ramen_audit::{ClientMeta, NewRecord, PeerInfo, RecordKind, AuditLog};
+use ramen_audit::{AuditError, AuditLog, ClientMeta, NewRecord, PeerInfo, RecordKind};
 use ramen_guard::{AuthzRequest, Decision, Guard};
 use ramen_proto::codec::Decoder;
 use ramen_proto::messages::{Denial, Welcome, WelcomeTag};
@@ -91,6 +92,44 @@ fn starts_within(path: &Path, prefix: &Path) -> bool {
         }
     }
     prefix_comps.count() <= path_comps.clone().count()
+}
+
+// ---------------------------------------------------------------------------
+// Audit append (fail-exit on failure)
+// ---------------------------------------------------------------------------
+
+static AUDIT_APPENDS: AtomicU64 = AtomicU64::new(0);
+
+/// Append an audit record; on failure **terminate the process** with
+/// `EXIT_AUDIT_UNAVAILABLE` (invariant 4, `00-overview.md`). The audit
+/// writer is process-wide: once it is dead, invariant 2 (audit precedes
+/// effect) can no longer hold for any connection, and continuing would be
+/// exactly the reduced-enforcement mode the invariant forbids. A v0
+/// supervisor therefore never sends `Error/AuditUnavailable` — the client
+/// sees a closed connection instead (`01-protocol.md` §6).
+///
+/// Test hook: `RAMEN_TEST_AUDIT_FAIL_AFTER=N` makes the Nth append
+/// (process-wide count) fail so tests can exercise this path.
+async fn audit_append(audit: &AuditLog, record: &NewRecord) -> u64 {
+    let n = AUDIT_APPENDS.fetch_add(1, Ordering::Relaxed) + 1;
+    let fail_at = std::env::var("RAMEN_TEST_AUDIT_FAIL_AFTER")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    let res = if fail_at == Some(n) {
+        tracing::error!("test hook: simulating audit writer failure on append {n}");
+        Err(AuditError::Closed)
+    } else {
+        audit.append(record).await
+    };
+    match res {
+        Ok(seq) => seq,
+        Err(e) => {
+            tracing::error!(
+                "audit append failed: {e} — invariant 4: the supervisor cannot continue without a working audit log; exiting"
+            );
+            std::process::exit(crate::EXIT_AUDIT_UNAVAILABLE);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -268,16 +307,7 @@ impl Connection {
                 truncated,
             }),
         };
-        if self.ctx.audit.append(&record).await.is_err() {
-            return Err(
-                self.fault(
-                    ErrorCode::AuditUnavailable,
-                    "audit log unavailable",
-                    "handshake: audit append failed",
-                )
-                .await,
-            );
-        }
+        audit_append(&self.ctx.audit, &record).await;
 
         let welcome = Message::Welcome(Welcome {
             v: PROTOCOL_VERSION,
@@ -407,8 +437,8 @@ impl Connection {
     ///     `Authorized` with the snapshot path and content hash, the
     ///     `fclonefileat(2)` snapshot + atomic write, then `Executed` or
     ///     `ExecutionFailed` (`05-operations.md` M6).
-    /// - A decision that cannot be audited is refused
-    ///   (`Error/AuditUnavailable`) — invariant 4.
+    /// - A decision that cannot be audited is never delivered: a dead audit
+    ///   writer exits the process (`EXIT_AUDIT_UNAVAILABLE`) — invariant 4.
     async fn dispatch(&mut self, req: Request) {
         let decision = match self.token.as_deref() {
             Some(token_b64) => self.ctx.guard.authorize(AuthzRequest {
@@ -448,22 +478,11 @@ impl Connection {
                         detail: serde_json::json!({ "code": code.as_str() }),
                         client: None,
                     };
-                    match ctx.audit.append(&record).await {
-                        Ok(audit_seq) => {
-                            Response::denied(
-                                req.id,
-                                Denial { code, reason, audit_seq },
-                            )
-                        }
-                        Err(e) => {
-                            tracing::error!("denied audit failed: {e}");
-                            Response::error(
-                                req.id,
-                                ErrorCode::AuditUnavailable,
-                                "denial could not be audited",
-                            )
-                        }
-                    }
+                    let audit_seq = audit_append(&ctx.audit, &record).await;
+                    Response::denied(
+                        req.id,
+                        Denial { code, reason, audit_seq },
+                    )
                 }
                 Decision::Allow => {
                     // The decision is Allow. Each operation's effect path
@@ -523,52 +542,36 @@ impl Connection {
             detail: serde_json::json!({}),
             client: None,
         };
-        match effect.ctx.audit.append(&record).await {
-            Err(e) => {
-                tracing::error!("authorized audit failed: {e}");
-                // A valid decision that cannot be audited is
-                // refused: no decision is delivered.
-                Response::error(
-                    effect.req.id,
-                    ErrorCode::AuditUnavailable,
-                    "decision could not be audited",
-                )
-            }
-            Ok(_) => {
-                let result = WhoamiResult {
-                    identity: effect
-                        .identity
-                        .clone()
-                        .expect("dispatch runs inside a session"),
-                    session: effect.session,
-                    capabilities: effect.ctx.guard.describe_capabilities(token),
-                    token_expires_at: effect.ctx.guard.token_expires_at(token),
-                };
-                // `Executed`: the (empty) effect completed. Non-mutating
-                // operations get the same Authorized→Executed pair as
-                // mutating ones, so the verifier's invariant 7 is uniform
-                // (`05-operations.md` M5, `02-audit.md` §8).
-                let record = NewRecord {
-                    kind: RecordKind::Executed,
-                    session: Some(effect.session),
-                    identity: effect.identity.clone(),
-                    peer: effect.peer.clone(),
-                    request_id: Some(effect.req.id),
-                    op_type: Some(effect.op_type.clone()),
-                    reversibility: Some(effect.reversibility),
-                    detail: serde_json::json!({}),
-                    client: None,
-                };
-                let resp = Response::ok(effect.req.id, OpResult::Whoami(result));
-                if let Err(e) = effect.ctx.audit.append(&record).await {
-                    // The decision was audited and the response reflects it;
-                    // a lost terminal record is logged, not a reason to
-                    // change the outcome.
-                    tracing::error!("executed audit failed: {e}");
-                }
-                resp
-            }
-        }
+        // The decision is delivered only if it can be audited; a dead
+        // writer exits the process instead (invariant 4).
+        audit_append(&effect.ctx.audit, &record).await;
+        let result = WhoamiResult {
+            identity: effect
+                .identity
+                .clone()
+                .expect("dispatch runs inside a session"),
+            session: effect.session,
+            capabilities: effect.ctx.guard.describe_capabilities(token),
+            token_expires_at: effect.ctx.guard.token_expires_at(token),
+        };
+        // `Executed`: the (empty) effect completed. Non-mutating operations
+        // get the same Authorized→Executed pair as mutating ones, so the
+        // verifier's invariant 7 is uniform (`05-operations.md` M5,
+        // `02-audit.md` §8).
+        let record = NewRecord {
+            kind: RecordKind::Executed,
+            session: Some(effect.session),
+            identity: effect.identity.clone(),
+            peer: effect.peer.clone(),
+            request_id: Some(effect.req.id),
+            op_type: Some(effect.op_type.clone()),
+            reversibility: Some(effect.reversibility),
+            detail: serde_json::json!({}),
+            client: None,
+        };
+        let resp = Response::ok(effect.req.id, OpResult::Whoami(result));
+        audit_append(&effect.ctx.audit, &record).await;
+        resp
     }
 
     /// `FileWrite` effect path (`05-operations.md` M6): pre-effect
@@ -613,23 +616,12 @@ impl Connection {
                     detail: serde_json::json!({ "code": "MalformedRequest" }),
                     client: None,
                 };
-                match effect.ctx.audit.append(&record).await {
-                    Ok(_) => {
-                        return Response::error(
-                            effect.req.id,
-                            ErrorCode::MalformedRequest,
-                            "content_b64 is invalid base64 or exceeds the 256 KiB content cap",
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!("errored audit failed: {e}");
-                        return Response::error(
-                            effect.req.id,
-                            ErrorCode::AuditUnavailable,
-                            "malformed-request record could not be audited",
-                        );
-                    }
-                }
+                audit_append(&effect.ctx.audit, &record).await;
+                return Response::error(
+                    effect.req.id,
+                    ErrorCode::MalformedRequest,
+                    "content_b64 is invalid base64 or exceeds the 256 KiB content cap",
+                );
             }
         };
 
@@ -679,26 +671,15 @@ impl Connection {
                 detail: serde_json::json!({ "code": "ConstraintViolated" }),
                 client: None,
             };
-            match effect.ctx.audit.append(&record).await {
-                Ok(audit_seq) => {
-                    return Response::denied(
-                        effect.req.id,
-                        Denial {
-                            code: DenialCode::ConstraintViolated,
-                            reason: "target path is outside the supervisor's configured allowed prefixes".into(),
-                            audit_seq,
-                        },
-                    );
-                }
-                Err(e) => {
-                    tracing::error!("denied audit failed: {e}");
-                    return Response::error(
-                        effect.req.id,
-                        ErrorCode::AuditUnavailable,
-                        "denial could not be audited",
-                    );
-                }
-            }
+            let audit_seq = audit_append(&effect.ctx.audit, &record).await;
+            return Response::denied(
+                effect.req.id,
+                Denial {
+                    code: DenialCode::ConstraintViolated,
+                    reason: "target path is outside the supervisor's configured allowed prefixes".into(),
+                    audit_seq,
+                },
+            );
         }
 
         // (4) Authorized — durable before any effect, including the
@@ -720,16 +701,7 @@ impl Connection {
             detail,
             client: None,
         };
-        if let Err(e) = effect.ctx.audit.append(&record).await {
-            tracing::error!("authorized audit failed: {e}");
-            // A valid decision that cannot be audited is refused: no
-            // decision is delivered and no effect runs.
-            return Response::error(
-                effect.req.id,
-                ErrorCode::AuditUnavailable,
-                "decision could not be audited",
-            );
-        }
+        audit_append(&effect.ctx.audit, &record).await;
 
         // Test-only hook: pause after the `Authorized` record is durable but
         // before the effect runs. The crash-window test (SIGKILL between
@@ -776,12 +748,7 @@ impl Connection {
                         restore: outcome.restore,
                     }),
                 );
-                if let Err(e) = effect.ctx.audit.append(&record).await {
-                    // The write landed and the response reflects it; a lost
-                    // terminal record is logged, not a reason to change the
-                    // outcome.
-                    tracing::error!("executed audit failed: {e}");
-                }
+                audit_append(&effect.ctx.audit, &record).await;
                 resp
             }
             Err(e) => {
@@ -798,9 +765,7 @@ impl Connection {
                 };
                 let message = e.to_string();
                 let resp = Response::error(effect.req.id, ErrorCode::ExecutionFailed, &message);
-                if let Err(e2) = effect.ctx.audit.append(&record).await {
-                    tracing::error!("executionfailed audit failed: {e2}");
-                }
+                audit_append(&effect.ctx.audit, &record).await;
                 resp
             }
         }
@@ -825,34 +790,21 @@ impl Connection {
             detail: detail.clone(),
             client: None,
         };
-        match effect.ctx.audit.append(&record).await {
-            Err(e) => {
-                tracing::error!("authorized audit failed: {e}");
-                Response::error(
-                    effect.req.id,
-                    ErrorCode::AuditUnavailable,
-                    "decision could not be audited",
-                )
-            }
-            Ok(_) => {
-                let record = NewRecord {
-                    kind: RecordKind::ExecutionFailed,
-                    session: Some(effect.session),
-                    identity: effect.identity.clone(),
-                    peer: effect.peer.clone(),
-                    request_id: Some(effect.req.id),
-                    op_type: Some(effect.op_type.clone()),
-                    reversibility: Some(effect.reversibility),
-                    detail: serde_json::json!({ "error": error }),
-                    client: None,
-                };
-                let resp = Response::error(effect.req.id, ErrorCode::ExecutionFailed, error);
-                if let Err(e) = effect.ctx.audit.append(&record).await {
-                    tracing::error!("executionfailed audit failed: {e}");
-                }
-                resp
-            }
-        }
+        audit_append(&effect.ctx.audit, &record).await;
+        let record = NewRecord {
+            kind: RecordKind::ExecutionFailed,
+            session: Some(effect.session),
+            identity: effect.identity.clone(),
+            peer: effect.peer.clone(),
+            request_id: Some(effect.req.id),
+            op_type: Some(effect.op_type.clone()),
+            reversibility: Some(effect.reversibility),
+            detail: serde_json::json!({ "error": error }),
+            client: None,
+        };
+        let resp = Response::error(effect.req.id, ErrorCode::ExecutionFailed, error);
+        audit_append(&effect.ctx.audit, &record).await;
+        resp
     }
 
     fn reap_pending(&mut self) {
@@ -929,9 +881,7 @@ impl Connection {
                 detail: serde_json::json!({ "reason": reason }),
                 client: None,
             };
-            if let Err(e) = self.ctx.audit.append(&record).await {
-                tracing::error!("violation audit failed: {e}");
-            }
+            audit_append(&self.ctx.audit, &record).await;
         } else {
             // Pre-handshake: rate-limited per peer PID.
             let decision = self.ctx.limiter.record(self.peer.pid as i32);
@@ -953,9 +903,7 @@ impl Connection {
                     detail,
                     client: None,
                 };
-                if let Err(e) = self.ctx.audit.append(&record).await {
-                    tracing::error!("violation audit failed: {e}");
-                }
+                audit_append(&self.ctx.audit, &record).await;
             }
         }
 
@@ -980,9 +928,7 @@ impl Connection {
             detail: serde_json::json!({ "reason": reason }),
             client: None,
         };
-        if let Err(e) = self.ctx.audit.append(&record).await {
-            tracing::error!("violation audit failed: {e}");
-        }
+        audit_append(&self.ctx.audit, &record).await;
         let response = Response::error(req.id, ErrorCode::VersionMismatch, reason);
         let _ = self.tx.try_send(Message::Response(response));
         CloseReason::Violation
@@ -1006,9 +952,7 @@ impl Connection {
                 detail: serde_json::json!({ "reason": audit_reason }),
                 client: None,
             };
-            if let Err(e) = self.ctx.audit.append(&record).await {
-                tracing::error!("fault audit failed: {e}");
-            }
+            audit_append(&self.ctx.audit, &record).await;
         } else {
             let _ = self.ctx.limiter.record(self.peer.pid as i32);
         }
@@ -1030,9 +974,7 @@ impl Connection {
             detail: serde_json::json!({ "reason": reason.audit_string() }),
             client: None,
         };
-        if let Err(e) = self.ctx.audit.append(&record).await {
-            tracing::error!("session-closed audit failed: {e}");
-        }
+        audit_append(&self.ctx.audit, &record).await;
     }
 }
 
