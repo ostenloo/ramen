@@ -255,13 +255,27 @@ impl ReceivedError {
 /// Parse a frame received from the supervisor and validate its `v`
 /// (`01-protocol.md` §4: the version is validated before the body is parsed,
 /// so a frame from another protocol version never reaches the body dispatch).
+///
+/// The `v` field is read with a shallow deserialize first — a full parse of
+/// the body must not happen before the version check, because a `v: 2`
+/// supervisor may send a body with fields this client's closed set does not
+/// know; that frame must surface as a version error, not a framing error.
 fn parse_received(frame: &[u8]) -> Result<Message, ReceivedError> {
-    let msg = Message::from_bytes(frame).map_err(ReceivedError::Framing)?;
-    let v = msg.version();
-    if v != PROTOCOL_VERSION {
-        return Err(ReceivedError::VersionMismatch(v));
+    let shallow: ShallowEnvelope = serde_json::from_slice(frame)
+        .map_err(|e| ReceivedError::Framing(WireError::Json(e.to_string())))?;
+    if shallow.v != PROTOCOL_VERSION {
+        return Err(ReceivedError::VersionMismatch(shallow.v));
     }
+    let msg = Message::from_bytes(frame).map_err(ReceivedError::Framing)?;
     Ok(msg)
+}
+
+/// Envelope-level `v` only. No `deny_unknown_fields`: the whole point is
+/// that a body this client does not understand must not fail the shallow
+/// read — the version check must get its answer first.
+#[derive(serde::Deserialize)]
+struct ShallowEnvelope {
+    v: u16,
 }
 
 /// Fail every in-flight call (used on EOF, framing death, and `Fault`).
@@ -383,9 +397,13 @@ mod tests {
         // may add denial/error codes this client does not know, so the client
         // must refuse the frame on version alone, never on the body.
         let welcome = r#"{"v":2,"type":"Welcome","session":"01ARZ3NDEKTSV4RRFFQ69G5FAV","identity":"i","capabilities":[]}"#;
-        let resp = r#"{"v":2,"status":"Ok","id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","result":{}}"#;
+        let resp = r#"{"v":2,"status":"Ok","id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","result":{"identity":"agent:planner","session":"01ARZ3NDEKTSV4RRFFQ69G5FAV","capabilities":[],"token_expires_at":null}}"#;
+        // A v2 body with a field this client's closed set does not know: the
+        // version check must win over body validation, or this frame would
+        // surface as a framing error instead of a version error (spec §4).
+        let resp_v2_body = r#"{"v":2,"status":"Ok","id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","result":{"identity":"agent:planner","session":"01ARZ3NDEKTSV4RRFFQ69G5FAV","capabilities":[],"token_expires_at":null,"extra":1}}"#;
         let fault = r#"{"v":2,"type":"Fault","error":{"code":"Internal","message":"x"}}"#;
-        for payload in [welcome, resp, fault] {
+        for payload in [welcome, resp, resp_v2_body, fault] {
             let e = parse_received(payload.as_bytes()).unwrap_err();
             assert!(
                 matches!(e, ReceivedError::VersionMismatch(2)),
