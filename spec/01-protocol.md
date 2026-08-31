@@ -84,11 +84,17 @@ Both serialize as their canonical string form. Newtype them; do not pass bare
 
 `PROTOCOL_VERSION: u16 = 1`.
 
-Every envelope carries `"v"`. The supervisor rejects any message whose `v` does
-not exactly equal its own `PROTOCOL_VERSION`. There is no range negotiation and
-no forward compatibility in v0. A mismatch on a request produces
-`Error/VersionMismatch` and terminates the connection; a mismatch on `Hello`
-produces a `Fault` (§7), because no request id exists yet.
+Every envelope carries `"v"`. **Both endpoints reject any frame whose `v` does
+not exactly equal their own `PROTOCOL_VERSION`, validated before the body is
+parsed.** There is no range negotiation and no forward compatibility in v0.
+
+- The supervisor rejects a request with a mismatched `v` with
+  `Error/VersionMismatch` and terminates the connection; a mismatch on
+  `Hello` produces a `Fault` (§7), because no request id exists yet.
+- The client validates `v` on every frame it receives — `Welcome`, `Response`,
+  and `Fault`. A mismatch is a transport error: the client fails any
+  in-flight calls and closes the connection. The client never sends a
+  response, so its only obligation is on the frames it receives.
 
 Version negotiation is a thing to add when a second implementation exists and
 cannot be upgraded in lockstep. Adding it now means maintaining compatibility
@@ -295,7 +301,7 @@ and the error codes are closed sets for v0: the lists above are normative, and
 a conforming client rejects a frame carrying an unrecognized code exactly as
 it rejects an unrecognized envelope `type` or response status (a transport
 error). A new code is a protocol change and ships with a new `v`; because the
-version is validated before the body is parsed (§3, §8), a conforming client
+version is validated before the body is parsed (§4), a conforming client
 never has to parse an unknown code. Do not extend a set within a version —
 that is what a version bump is for.
 

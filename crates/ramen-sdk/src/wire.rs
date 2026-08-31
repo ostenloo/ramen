@@ -307,6 +307,24 @@ impl Serialize for Message {
 }
 
 impl Message {
+    /// The `v` field of this envelope (`01-protocol.md` §4). Every envelope
+    /// carries it; a conforming endpoint rejects any frame whose `v` does not
+    /// exactly equal its own `PROTOCOL_VERSION`, validated *before* the body
+    /// is parsed.
+    pub fn version(&self) -> u16 {
+        match self {
+            Message::Hello(m) => m.v,
+            Message::Welcome(m) => m.v,
+            Message::Request(m) => m.v,
+            Message::Response(r) => match r {
+                Response::Ok { v, .. }
+                | Response::Denied { v, .. }
+                | Response::Error { v, .. } => *v,
+            },
+            Message::Fault(m) => m.v,
+        }
+    }
+
     /// Serialize to the JSON wire form.
     pub fn to_json(&self) -> Result<String, WireError> {
         serde_json::to_string(self).map_err(|e| WireError::Json(e.to_string()))
@@ -471,6 +489,50 @@ impl<'de> serde::de::Visitor<'de> for DupVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_accessor_covers_every_envelope() {
+        let hello = Message::Hello(Hello::new("tok".into(), ClientInfo::new("c", "1")));
+        assert_eq!(hello.version(), PROTOCOL_VERSION);
+
+        let welcome = Message::Welcome(Welcome {
+            v: 7,
+            kind: Welcome::TYPE.to_string(),
+            session: SessionId(ulid::Ulid::new()),
+            identity: "i".into(),
+            capabilities: vec![],
+        });
+        assert_eq!(welcome.version(), 7);
+
+        let req = Message::Request(Request::new(
+            RequestId::new(),
+            Operation::Whoami(WhoamiOp {}),
+        ));
+        assert_eq!(req.version(), PROTOCOL_VERSION);
+
+        for r in [
+            Response::Ok { v: 3, id: RequestId::new(), result: serde_json::json!({}) },
+            Response::Denied {
+                v: 3,
+                id: RequestId::new(),
+                denial: Denial { code: DenialCode::TokenExpired, reason: "r".into(), audit_seq: 1 },
+            },
+            Response::Error {
+                v: 3,
+                id: RequestId::new(),
+                error: ErrorInfo { code: ErrorCode::Internal, message: "m".into() },
+            },
+        ] {
+            assert_eq!(Message::Response(r).version(), 3);
+        }
+
+        let fault = Message::Fault(Fault {
+            v: 9,
+            kind: Fault::TYPE.to_string(),
+            error: ErrorInfo { code: ErrorCode::Internal, message: "m".into() },
+        });
+        assert_eq!(fault.version(), 9);
+    }
 
     #[test]
     fn hello_round_trips_through_value() {

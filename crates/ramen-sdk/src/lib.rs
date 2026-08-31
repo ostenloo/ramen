@@ -147,7 +147,8 @@ impl Client {
                 Ok(n) => {
                     dec.feed(&buf[..n]).map_err(SdkError::Framing)?;
                     if let Some(f) = dec.next_frame().map_err(SdkError::Framing)? {
-                        match Message::from_bytes(&f).map_err(SdkError::Framing)? {
+                        let msg = parse_received(&f).map_err(|e| e.into_sdk_error())?;
+                        match msg {
                             Message::Welcome(w) => break w,
                             Message::Response(Response::Error { error, .. }) => {
                                 return Err(SdkError::Handshake {
@@ -228,6 +229,41 @@ impl Drop for Client {
     }
 }
 
+/// A frame the supervisor sent that the client cannot accept: either illegal
+/// framing (`Framing`) or a well-formed envelope whose `v` differs from the
+/// client's `PROTOCOL_VERSION` (`VersionMismatch`). Cloneable so a single
+/// error can be handed to every in-flight call.
+#[derive(Clone, Debug)]
+enum ReceivedError {
+    Framing(WireError),
+    VersionMismatch(u16),
+}
+
+impl ReceivedError {
+    fn into_sdk_error(self) -> SdkError {
+        match self {
+            ReceivedError::Framing(e) => SdkError::Framing(e),
+            // A version mismatch is a transport error (spec §4): the client
+            // closes the connection and fails every in-flight call.
+            ReceivedError::VersionMismatch(v) => SdkError::ProtocolViolation(format!(
+                "version mismatch: got {v}, expected {PROTOCOL_VERSION}"
+            )),
+        }
+    }
+}
+
+/// Parse a frame received from the supervisor and validate its `v`
+/// (`01-protocol.md` §4: the version is validated before the body is parsed,
+/// so a frame from another protocol version never reaches the body dispatch).
+fn parse_received(frame: &[u8]) -> Result<Message, ReceivedError> {
+    let msg = Message::from_bytes(frame).map_err(ReceivedError::Framing)?;
+    let v = msg.version();
+    if v != PROTOCOL_VERSION {
+        return Err(ReceivedError::VersionMismatch(v));
+    }
+    Ok(msg)
+}
+
 /// Fail every in-flight call (used on EOF, framing death, and `Fault`).
 fn fail_all(
     pending: &Arc<Mutex<HashMap<RequestId, InFlight>>>,
@@ -257,9 +293,9 @@ async fn reader_task(
                     break;
                 }
                 'frames: while let Some(frame) = dec.next_frame().unwrap() {
-                    match Message::from_bytes(&frame) {
+                    match parse_received(&frame) {
                         Err(e) => {
-                            fail_all(&pending, || SdkError::Framing(e.clone()));
+                            fail_all(&pending, || e.clone().into_sdk_error());
                             dead = true;
                             break 'frames;
                         }
@@ -331,4 +367,57 @@ fn resolve(
     }
     // An unknown ID is protocol-illegal from the supervisor; ignore
     // defensively rather than tear down the connection.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A frame from a different protocol version must be rejected *before*
+    /// body dispatch, in exactly the same shape as a framing error (spec §4:
+    /// the version is validated before the body is parsed). Without the check,
+    /// a `v: 2` response would be parsed and matched to an in-flight call.
+    #[test]
+    fn parse_received_rejects_wrong_version_on_every_envelope() {
+        // The closed-set decision makes this load-bearing: a `v: 2` supervisor
+        // may add denial/error codes this client does not know, so the client
+        // must refuse the frame on version alone, never on the body.
+        let welcome = r#"{"v":2,"type":"Welcome","session":"01ARZ3NDEKTSV4RRFFQ69G5FAV","identity":"i","capabilities":[]}"#;
+        let resp = r#"{"v":2,"status":"Ok","id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","result":{}}"#;
+        let fault = r#"{"v":2,"type":"Fault","error":{"code":"Internal","message":"x"}}"#;
+        for payload in [welcome, resp, fault] {
+            let e = parse_received(payload.as_bytes()).unwrap_err();
+            assert!(
+                matches!(e, ReceivedError::VersionMismatch(2)),
+                "expected VersionMismatch(2) for {payload}, got {e:?}"
+            );
+            let sdk_err = e.clone().into_sdk_error();
+            match sdk_err {
+                SdkError::ProtocolViolation(msg) => {
+                    assert!(msg.contains("version mismatch"), "got: {msg}");
+                    assert!(msg.contains("2"), "got: {msg}");
+                }
+                other => panic!("expected ProtocolViolation, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_received_accepts_matching_version() {
+        let welcome = r#"{"v":1,"type":"Welcome","session":"01ARZ3NDEKTSV4RRFFQ69G5FAV","identity":"i","capabilities":[]}"#;
+        assert!(matches!(
+            parse_received(welcome.as_bytes()).unwrap(),
+            Message::Welcome(_)
+        ));
+    }
+
+    #[test]
+    fn parse_received_still_reports_framing_errors() {
+        // Malformed JSON is a framing error, not a version error.
+        let e = parse_received(b"{not json").unwrap_err();
+        assert!(matches!(e, ReceivedError::Framing(_)));
+        // Duplicate keys remain rejected (protocol's asserted behavior).
+        let e = parse_received(b"{\"v\":1,\"v\":2}").unwrap_err();
+        assert!(matches!(e, ReceivedError::Framing(_)));
+    }
 }
