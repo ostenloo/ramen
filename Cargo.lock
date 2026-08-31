@@ -1004,6 +1004,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ramenctl"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "biscuit-auth",
+ "clap",
+ "libc",
+ "ramen-audit",
+ "ramen-sdk",
+ "ramen-supervisor",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "rand"
 version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"

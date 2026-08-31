@@ -1,0 +1,26 @@
+[package]
+name = "ramenctl"
+description = "Ramen control-plane CLI: the first consumer of ramen-sdk (M7)"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ramenctl"
+path = "src/main.rs"
+
+[dependencies]
+ramen-sdk = { path = "../../crates/ramen-sdk" }
+biscuit-auth = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+# Test-only: the integration tests spawn a supervisor, pin this binary's
+# code-signing identifier in its `[peer] requirement`, and mint tokens.
+[dev-dependencies]
+tempfile = { workspace = true }
+libc = { workspace = true }
+ramen-supervisor = { path = "../../crates/ramen-supervisor" }
+ramen-audit = { path = "../../crates/ramen-audit" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

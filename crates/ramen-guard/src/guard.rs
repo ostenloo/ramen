@@ -179,8 +179,7 @@ impl Guard {
         else {
             return Vec::new();
         };
-        caps.into_iter()
-            .filter_map(|(name,)| {
+        let mut out: Vec<CapabilitySummary> = caps.into_iter().filter_map(|(name,)| {
                 let reversibility = Operation::reversibility_for_type_name(&name)?;
                 let constraints = if name == "FileWrite" {
                     let Ok(prefixes) = q.query::<_, (String,), error::Token>(
@@ -188,7 +187,8 @@ impl Guard {
                     ) else {
                         return None;
                     };
-                    let v: Vec<String> = prefixes.into_iter().map(|(p,)| p).collect();
+                    let mut v: Vec<String> = prefixes.into_iter().map(|(p,)| p).collect();
+                    v.sort();
                     if v.is_empty() {
                         None
                     } else {
@@ -203,7 +203,12 @@ impl Guard {
                     constraints,
                 })
             })
-            .collect()
+        .collect();
+        // Datalog result order is not stable across runs; the capability
+        // summary is part of the `Welcome`/`Whoami` wire surface, so it
+        // must serialize deterministically (sort by op name).
+        out.sort_by(|a, b| a.op.cmp(&b.op));
+        out
     }
 
     /// The `expires_at` fact the token declares, as an ISO-8601 UTC string
