@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.ramen.supervisor</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/austin/.local/bin/ramen-supervisor</string>
+		<string>--config</string>
+		<string>/Users/austin/.ramen/config.toml</string>
+	</array>
+
+	<!--
+		KeepAlive with SuccessfulExit = false: restart on every *nonzero* exit,
+		never on a clean one. This is what makes invariant 4 (00-overview.md)
+		work: a supervisor that cannot write the audit log exits nonzero
+		(EXIT_AUDIT_UNAVAILABLE), and the restart makes the failure visible
+		rather than leaving a dead supervisor that looks alive in launchctl.
+		A KeepAlive that suppresses restarts on nonzero exit reopens the
+		silent-degradation mode the fail-exit design removed.
+
+		ThrottleInterval bounds the crash loop a permanently unwritable audit
+		log produces: launchd retries at most once per interval, so the
+		failure is a visible tick, not a spin.
+	-->
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+
+	<!--
+		capture stdout/stderr to files instead of /dev/null so the
+		supervisor's tracing output (liveness, handshake logs) is inspectable
+		after the fact.
+	-->
+	<key>StandardOutPath</key>
+	<string>/Users/austin/.ramen/supervisor.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/austin/.ramen/supervisor.err.log</string>
+
+	<!--
+		Interactive: the supervisor is a foreground interactive process
+		(accepting connections on a Unix socket), not a background
+		batch job. launchd schedules it accordingly.
+	-->
+	<key>ProcessType</key>
+	<string>Interactive</string>
+</dict>
+</plist>
