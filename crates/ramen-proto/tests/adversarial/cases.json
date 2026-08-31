@@ -67,6 +67,10 @@
     {
       "file": "ok_empty_result.json",
       "expect": "reject"
+    },
+    {
+      "file": "response_unknown_variant_field.json",
+      "expect": "reject"
     }
   ]
 }

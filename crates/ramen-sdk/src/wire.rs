@@ -198,7 +198,7 @@ impl Request {
 /// has no non-terminal status (`Pending` was cut — 00-overview.md D1), and
 /// the SDK rejects an unrecognized status with an error rather than waiting.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "status")]
+#[serde(tag = "status", deny_unknown_fields)]
 pub enum Response {
     /// `result` is op-specific and passed through as JSON (the SDK does not
     /// model the result payload per the spec §2 `OpOutcome::Ok(Value)`),

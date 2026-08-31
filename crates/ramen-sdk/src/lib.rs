@@ -256,26 +256,184 @@ impl ReceivedError {
 /// (`01-protocol.md` §4: the version is validated before the body is parsed,
 /// so a frame from another protocol version never reaches the body dispatch).
 ///
-/// The `v` field is read with a shallow deserialize first — a full parse of
-/// the body must not happen before the version check, because a `v: 2`
-/// supervisor may send a body with fields this client's closed set does not
-/// know; that frame must surface as a version error, not a framing error.
+/// `v` is read with a shallow scan that never inspects past the version
+/// field: the ordering guarantee is only as strong as the shallowest thing
+/// that can fail first, so a frame from another protocol version — even one
+/// whose body already uses a future encoding — must surface as a version
+/// error, not a framing error. If `v` cannot be read as a clean non-negative
+/// integer at the top level, the full parse runs and the real framing error
+/// surfaces.
 fn parse_received(frame: &[u8]) -> Result<Message, ReceivedError> {
-    let shallow: ShallowEnvelope = serde_json::from_slice(frame)
-        .map_err(|e| ReceivedError::Framing(WireError::Json(e.to_string())))?;
-    if shallow.v != PROTOCOL_VERSION {
-        return Err(ReceivedError::VersionMismatch(shallow.v));
+    if let Some(v) = shallow_version(frame) {
+        if v != PROTOCOL_VERSION {
+            return Err(ReceivedError::VersionMismatch(v));
+        }
     }
     let msg = Message::from_bytes(frame).map_err(ReceivedError::Framing)?;
     Ok(msg)
 }
 
-/// Envelope-level `v` only. No `deny_unknown_fields`: the whole point is
-/// that a body this client does not understand must not fail the shallow
-/// read — the version check must get its answer first.
-#[derive(serde::Deserialize)]
-struct ShallowEnvelope {
-    v: u16,
+/// Read the top-level `v` field of a JSON object without parsing the rest of
+/// the frame. Returns `None` when the frame does not begin with a top-level
+/// object carrying a clean integer `v`; that is not an error on its own —
+/// the full parse is what reports it.
+fn shallow_version(frame: &[u8]) -> Option<u16> {
+    const WS: &[u8] = b" \t\n\r";
+    let mut i = 0usize;
+    let skip_ws = |i: &mut usize| {
+        while *i < frame.len() && WS.contains(&frame[*i]) {
+            *i += 1;
+        }
+    };
+
+    skip_ws(&mut i);
+    if frame.get(i) != Some(&b'{') {
+        return None;
+    }
+    i += 1;
+
+    loop {
+        skip_ws(&mut i);
+        match frame.get(i) {
+            None => return None,
+            Some(&b'}') => return None, // top-level object ended without `v`
+            Some(&b',') => {
+                i += 1;
+                continue;
+            }
+            Some(&b'"') => {}
+            _ => return None, // not an object key
+        }
+        // Key string: `i` is at the opening quote; scan to the close.
+        i += 1;
+        let kstart = i;
+        loop {
+            match frame.get(i) {
+                None => return None,
+                Some(&b'\\') => i += 2,
+                Some(&b'"') => break,
+                Some(_) => i += 1,
+            }
+        }
+        let key = &frame[kstart..i];
+        i += 1; // closing quote
+        skip_ws(&mut i);
+        if frame.get(i) != Some(&b':') {
+            return None;
+        }
+        i += 1;
+        skip_ws(&mut i);
+
+        if key == b"v" {
+            let dstart = i;
+            let mut v: u64 = 0;
+            while let Some(&d) = frame.get(i) {
+                if !d.is_ascii_digit() {
+                    break;
+                }
+                v = v.checked_mul(10)?.checked_add((d - b'0') as u64)?;
+                i += 1;
+            }
+            // No digits at all (e.g. `"v":"1"`): the full parse reports the
+            // type error; a `Some(0)` here would surface as a bogus version
+            // mismatch.
+            if i == dstart {
+                return None;
+            }
+            // `1.5`, `1e3`, `1x`: not a clean integer literal — let the full
+            // parse report it.
+            if matches!(frame.get(i), Some(&c) if c.is_ascii_digit() || c == b'.' || c == b'e' || c == b'E') {
+                return None;
+            }
+            return u16::try_from(v).ok();
+        }
+
+        // Another key: skip its value, then expect `,` or `}`.
+        if !skip_json_value(frame, &mut i) {
+            return None;
+        }
+        skip_ws(&mut i);
+        if !matches!(frame.get(i), Some(&b',') | Some(&b'}')) {
+            return None;
+        }
+        if frame[i] == b'}' {
+            return None;
+        }
+        i += 1;
+    }
+}
+
+/// Skip one JSON value starting at `i`, advancing `i` past it. Shallow by
+/// design: it only needs to be *right* on values that precede `v` in a
+/// frame the full parser would accept; everything else falls through to the
+/// full parse, which reports the real error.
+fn skip_json_value(frame: &[u8], i: &mut usize) -> bool {
+    const WS: &[u8] = b" \t\n\r";
+    while *i < frame.len() && WS.contains(&frame[*i]) {
+        *i += 1;
+    }
+    match frame.get(*i) {
+        Some(&b'"') => {
+            *i += 1;
+            loop {
+                match frame.get(*i) {
+                    None => return false,
+                    Some(&b'\\') => *i += 2,
+                    Some(&b'"') => {
+                        *i += 1;
+                        return true;
+                    }
+                    Some(_) => *i += 1,
+                }
+            }
+        }
+        Some(&b'{') | Some(&b'[') => {
+            let mut depth = 0usize;
+            let mut in_str = false;
+            while *i < frame.len() {
+                match frame[*i] {
+                    b'\\' if in_str => *i += 2,
+                    b'"' => {
+                        in_str = !in_str;
+                        *i += 1;
+                    }
+                    b'{' | b'[' if !in_str => {
+                        depth += 1;
+                        *i += 1;
+                    }
+                    b'}' | b']' if !in_str => {
+                        depth -= 1;
+                        *i += 1;
+                        if depth == 0 {
+                            return true;
+                        }
+                    }
+                    _ => *i += 1,
+                }
+            }
+            false
+        }
+        Some(&c) if c.is_ascii_digit() || c == b'-' => {
+            *i += 1;
+            while let Some(&c) = frame.get(*i) {
+                if c.is_ascii_digit() || c == b'.' || c == b'e' || c == b'E' || c == b'+' {
+                    *i += 1;
+                } else {
+                    break;
+                }
+            }
+            true
+        }
+        Some(_) => {
+            // true / false / null: skip to the next structural character.
+            let start = *i;
+            while *i < frame.len() && !b",}]\n\t ".contains(&frame[*i]) {
+                *i += 1;
+            }
+            *i > start
+        }
+        None => false,
+    }
 }
 
 /// Fail every in-flight call (used on EOF, framing death, and `Fault`).
@@ -402,8 +560,16 @@ mod tests {
         // version check must win over body validation, or this frame would
         // surface as a framing error instead of a version error (spec §4).
         let resp_v2_body = r#"{"v":2,"status":"Ok","id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","result":{"identity":"agent:planner","session":"01ARZ3NDEKTSV4RRFFQ69G5FAV","capabilities":[],"token_expires_at":null,"extra":1}}"#;
+        // A v2 body that is not valid JSON past the version field (a future
+        // encoding): the version check must still win — the ordering
+        // guarantee is only as strong as the shallowest thing that can fail
+        // first.
+        let resp_v2_future_encoding = r#"{"v":2,"status":"Ok","result":{not json"#;
+        // `v` as the last field: the shallow scan must skip the earlier
+        // values to reach it.
+        let resp_v2_last = r#"{"status":"Ok","id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","v":2}"#;
         let fault = r#"{"v":2,"type":"Fault","error":{"code":"Internal","message":"x"}}"#;
-        for payload in [welcome, resp, resp_v2_body, fault] {
+        for payload in [welcome, resp, resp_v2_body, resp_v2_future_encoding, resp_v2_last, fault] {
             let e = parse_received(payload.as_bytes()).unwrap_err();
             assert!(
                 matches!(e, ReceivedError::VersionMismatch(2)),
@@ -418,6 +584,25 @@ mod tests {
                 other => panic!("expected ProtocolViolation, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn shallow_version_reads_only_as_much_as_the_version() {
+        // The version, wherever it sits at the top level.
+        assert_eq!(shallow_version(b"{\"v\":1}"), Some(1));
+        assert_eq!(shallow_version(b"{\"status\":\"Ok\",\"v\":1}"), Some(1));
+        assert_eq!(
+            shallow_version(b"{\"v\": 2 ,\"junk\":{\"a\":[1,{\"b\":\"x\"}]}}"),
+            Some(2)
+        );
+        // Not a top-level object, or no clean integer `v`: the full parse
+        // reports these, the shallow scan must not get an answer.
+        assert_eq!(shallow_version(b"[1]"), None);
+        assert_eq!(shallow_version(b"{\"status\":\"Ok\"}"), None);
+        assert_eq!(shallow_version(b"{\"v\":\"1\"}"), None);
+        assert_eq!(shallow_version(b"{\"v\":1.5}"), None);
+        assert_eq!(shallow_version(b"{\"v\":65536}"), None);
+        assert_eq!(shallow_version(b"{}garbage"), None);
     }
 
     #[test]
