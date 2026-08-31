@@ -10,6 +10,7 @@
 //! ```
 
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -117,6 +118,15 @@ async fn run() -> i32 {
             }
         }
     };
+    // The state directory holds snapshots — the pre-images of every file an
+    // agent has ever overwritten. It is control-plane state, not agent data:
+    // 0700, explicitly, so a default umask or a pre-existing 0755 directory
+    // cannot leave pre-images world-readable on a multi-user host
+    // (`05-operations.md` M6).
+    if let Err(e) = std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)) {
+        eprintln!("startup failed: state_dir permissions (0700): {e}");
+        return 1;
+    }
     let control_plane = match ControlPlanePaths::new(
         &[
             config.socket_path.clone(),
@@ -147,6 +157,12 @@ async fn run() -> i32 {
     let snapshots_dir = state_dir.join("snapshots");
     if let Err(e) = std::fs::create_dir_all(&snapshots_dir) {
         eprintln!("startup failed: snapshots dir: {e}");
+        return 1;
+    }
+    // Same guarantee as the state dir (inherited, but stated for the leaf):
+    // snapshots are 0600 files inside a 0700 directory.
+    if let Err(e) = std::fs::set_permissions(&snapshots_dir, std::fs::Permissions::from_mode(0o700)) {
+        eprintln!("startup failed: snapshots dir permissions (0700): {e}");
         return 1;
     }
     let config_prefixes: Vec<std::path::PathBuf> = config

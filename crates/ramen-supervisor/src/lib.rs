@@ -3,7 +3,7 @@
 //! v0 milestones M3+M4+M5+M6: peer identity (macOS code-signing requirement
 //! over `LOCAL_PEERTOKEN`), Biscuit handshake, Biscuit authorization
 //! through `ramen-guard` with both decision paths audited, the `Whoami`
-//! operation, the `FileWrite` operation (snapshot via `clonefile`, atomic
+//! operation, the `FileWrite` operation (snapshot via `fclonefileat(2)`, atomic
 //! rename, durable audit trail), fatal protocol violations, connection
 //! caps, rate-limited rejection auditing, and graceful shutdown.
 //!
@@ -27,6 +27,7 @@ compile_error!(
 pub mod config;
 pub mod conn;
 pub mod filewrite;
+pub mod fsat;
 pub mod rate_limit;
 pub mod rootkey;
 pub mod socket;

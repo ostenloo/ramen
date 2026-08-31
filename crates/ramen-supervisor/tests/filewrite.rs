@@ -675,3 +675,86 @@ fn authorized_precedes_effect_and_crash_window_leaves_dangling_authorized() {
     let snapshots_dir = sup.parts.state.join("snapshots");
     assert_eq!(snapshots_dir.read_dir().unwrap().count(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Criterion: TOCTOU by path-component swap. The guard checks the path at
+// authorization time. Between `Authorized` and the effect, an agent with
+// write access to an intermediate directory can swap the target's parent
+// (move it aside and plant a symlink at the same path pointing at a
+// different in-prefix directory). The effect must land in the directory
+// that was pinned — never in the swapped-in one. Verified via the
+// `RAMEN_TEST_PAUSE_AFTER_AUTHORIZED` window.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn symlink_swap_during_window_cannot_steer_the_write() {
+    let fx = WriteFixture::new();
+    let requirement = format!("identifier \"{}\"", common::test_binary_identifier());
+    let body = fx.fx.parts.body_with_prefixes(&requirement, std::slice::from_ref(&fx.prefix));
+    // 5-second window between the durable `Authorized` record and the effect.
+    let mut sup = Supervisor::start_with_body_env(
+        &fx.fx,
+        &body,
+        &[("RAMEN_TEST_PAUSE_AFTER_AUTHORIZED", "5")],
+    );
+
+    let dir = fx.dir();
+    // The authorized target lives in `a/`; `b/` is a decoy directory with
+    // its own content.
+    let a = dir.join("a");
+    std::fs::create_dir(&a).unwrap();
+    let b = dir.join("b");
+    std::fs::create_dir(&b).unwrap();
+    std::fs::write(b.join("b.txt"), b"decoy").unwrap();
+
+    let token = sup.filewrite_token("agent:swap", &fx.prefix.to_string_lossy());
+    let mut client = Client::connect(&sup.socket);
+    client.hello(&token);
+
+    let target = a.join("f.txt");
+    let req = ramen_proto::Request::new(write_op(&target, "aGVsbG8=", WriteMode::Create));
+    let id = req.id;
+    client.send(&ramen_proto::Message::Request(req));
+
+    // Wait until `Authorized` is durable (the pin has already happened).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if kind_for(&events(&sup), id, RecordKind::Authorized).is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Authorized never appeared in the audit log"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Swap the target's parent: move the real directory aside (still inside
+    // the configured prefix) and plant a symlink at the same path pointing
+    // at the decoy directory. Every path-string re-resolution of
+    // `<prefix>/a/f.txt` from now on lands in `b/`.
+    let a_real = dir.join("a-real");
+    std::fs::rename(&a, &a_real).unwrap();
+    std::os::unix::fs::symlink(&a_real, &a).unwrap();
+
+    // The effect (after the 5-second window) must write through the pin.
+    let resp = match client.recv() {
+        Some(ramen_proto::Message::Response(r)) => r,
+        other => panic!("expected Response, got {other:?}"),
+    };
+    assert_filewrite_ok(&resp);
+
+    // The write landed in the pinned (original) directory...
+    assert_eq!(std::fs::read(a_real.join("f.txt")).unwrap(), b"hello");
+    // ...and the decoy directory is untouched — no path re-resolution may
+    // have steered the write into `b/`.
+    assert!(
+        !b.join("f.txt").exists(),
+        "the write must not land in the swapped-in directory"
+    );
+    assert_eq!(b.read_dir().unwrap().count(), 1);
+
+    common::assert_chain_valid(&sup.audit);
+    drop(client);
+    sup.terminate_and_wait();
+}

@@ -2,36 +2,44 @@
 //!
 //! Execution sequence (order is load-bearing; do not rearrange):
 //!
-//! 1. (guard, upstream) path canonicalized and checked.
-//! 2. (dispatch, upstream) base64 decoded, 256 KiB cap enforced.
-//! 3. (dispatch, upstream) audit `Authorized` — durable before any effect,
-//!    including the snapshot.
-//! 4. Snapshot (`Overwrite` only): `clonefile(target, snapshot_path)`.
-//!    Failure → `WriteError::Snapshot`; **no write is attempted**.
-//! 5. Write:
-//!    - `Create`: `O_WRONLY|O_CREAT|O_EXCL, 0644`, write, `fsync` the file,
-//!      `fsync` the directory.
-//!    - `Overwrite`: temp file in the same directory, write, `fsync` the
-//!      file, `rename` over the target, `fsync` the directory (the
-//!      atomic-rename pattern: a crash leaves either the old or the new
-//!      file, never a truncated one).
-//! 6. (dispatch, upstream) audit `Executed`.
+//! Step 1 (guard, upstream): path canonicalized and checked.
+//! Step 2 (dispatch, upstream): base64 decoded, 256 KiB cap enforced.
+//! Step 2b (dispatch): **pin the parent directory** (`fsat::pin_parent`).
+//! The parent is resolved exactly once, and the effect's directory is
+//! verified by device + inode. Every syscall of steps 4–5 runs
+//! `*at`-relative to the pinned fd, naming the target by its bare final
+//! component — no syscall re-resolves the path string, so a component
+//! swap timed anywhere after the pin cannot steer the write
+//! (`05-operations.md` M6 step 2).
+//! Step 3 (dispatch, upstream): audit `Authorized` — durable before any
+//! effect, including the snapshot.
+//! Step 4 (effect): Snapshot (`Overwrite` only) — the target is opened
+//! `*at`-relative to the pin (`O_NOFOLLOW`) and cloned to the snapshot via
+//! `fclonefileat(2)` of that fd. Failure → `WriteError::Snapshot`; **no
+//! write is attempted**.
+//! Step 5 (effect): Write.
+//! `Create`: `openat(O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW, 0644)`, write,
+//! `fsync` the file, `fsync` the pinned directory fd.
+//! `Overwrite`: temp file in the pinned directory, write, `fsync` the file,
+//! `renameat` over the target, `fsync` the pinned directory fd (the
+//! atomic-rename pattern: a crash leaves either the old or the new file,
+//! never a truncated one).
+//! Step 6 (dispatch, upstream): audit `Executed`.
 //!
 //! The snapshot path is `<state_dir>/snapshots/<session>.<request>.<sanitized
 //! basename>` — deterministic, so it can be recorded in the `Authorized`
 //! record before the snapshot exists.
 
-use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 
 use ramen_proto::messages::{RestoreHandle, RestoreKind, Reversibility, WriteMode};
 use ramen_proto::{FileWriteOp, RequestId, SessionId};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::platform::clonefile;
+use crate::fsat::{self, PinnedParent};
 
 /// Decoded-content cap, well under the 1 MiB frame limit
 /// (`05-operations.md` M6).
@@ -48,7 +56,7 @@ pub struct WriteOutcome {
     pub restore: RestoreHandle,
     /// The snapshot file on disk (`Overwrite` only; `Create` has no prior
     /// content, so no snapshot file exists — the handle is still reported).
-    pub snapshot: Option<PathBuf>,
+    pub snapshot: Option<std::path::PathBuf>,
 }
 
 /// Effect failures. Both are audited `ExecutionFailed` and answered
@@ -65,12 +73,12 @@ pub enum WriteError {
     Write(String),
 }
 
-/// Run the full effect for an authorized `FileWrite`.
-///
-/// `target` is the canonicalized path the guard checked; `content` is the
-/// decoded bytes (already capped); `session`/`request` name the snapshot.
-pub fn execute(
-    target: &Path,
+/// Run the full effect for an authorized `FileWrite`, every syscall
+/// `*at`-relative to `pinned` (the parent directory resolved exactly once,
+/// `05-operations.md` M6 step 2). `content` is the decoded bytes (already
+/// capped); `session`/`request` name the snapshot.
+pub fn execute_pinned(
+    pinned: &PinnedParent,
     content: &[u8],
     mode: WriteMode,
     session: SessionId,
@@ -78,12 +86,12 @@ pub fn execute(
     snapshots_dir: &Path,
 ) -> Result<WriteOutcome, WriteError> {
     let content_sha256 = sha256_hex(content);
-    let handle = snapshot_handle_name(target, session, request);
+    let handle = snapshot_handle_name(&pinned.canon_target, session, request);
 
     match mode {
-        WriteMode::Create => execute_create(target, content, &content_sha256, &handle),
+        WriteMode::Create => execute_create(pinned, content, &content_sha256, &handle),
         WriteMode::Overwrite => execute_overwrite(
-            target,
+            pinned,
             content,
             &content_sha256,
             &handle,
@@ -93,42 +101,49 @@ pub fn execute(
     }
 }
 
-/// `Create`: the kernel provides the atomic "fail if exists" via `O_EXCL`.
+/// `Create`: the kernel provides the atomic "fail if exists" via `O_EXCL`;
+/// `O_NOFOLLOW` refuses a symlink planted at the target after authorization.
 ///
-/// A failure mid-write leaves no partial file: it is unlinked (best effort)
-/// so the observable state is exactly "the file does not exist".
+/// A failure mid-write leaves no partial file: it is unlinked (best effort,
+/// relative to the pin) so the observable state is exactly "the file does
+/// not exist".
 fn execute_create(
-    target: &Path,
+    pinned: &PinnedParent,
     content: &[u8],
     content_sha256: &str,
     handle: &str,
 ) -> Result<WriteOutcome, WriteError> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o644)
-        .open(target)
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::AlreadyExists => {
-                WriteError::Write("target already exists (mode Create, O_EXCL)".into())
-            }
-            _ => WriteError::Write(format!("open: {e}")),
-        })?;
+    let name = &pinned.target_name;
+    let mut file = fsat::openat(
+        &pinned.fd,
+        name,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+        0o644,
+    )
+    .map_err(|e| match e.raw_os_error() {
+        Some(libc::EEXIST) => {
+            WriteError::Write("target already exists (mode Create, O_EXCL)".into())
+        }
+        Some(libc::ELOOP) => WriteError::Write(
+            "target is a symlink at effect time (swapped after authorization)".into(),
+        ),
+        _ => WriteError::Write(format!("open: {e}")),
+    })?;
 
     if let Err(e) = write_and_sync(&mut file, content) {
         // Best-effort cleanup of the partial new file; there is no prior
         // content to preserve.
-        let _ = std::fs::remove_file(target);
+        let _ = fsat::unlinkat(&pinned.fd, name);
         return Err(WriteError::Write(format!("write: {e}")));
     }
-    if let Err(e) = fsync_dir(target.parent().unwrap_or(Path::new("/"))) {
+    if let Err(e) = fsat::fsync_dir_fd(&pinned.fd) {
         // The content is fully on disk; a lost directory fsync is logged
         // upstream, not a failed write.
         tracing::warn!("create: directory fsync failed: {e}");
     }
 
     Ok(WriteOutcome {
-        canonical: target.to_string_lossy().into_owned(),
+        canonical: pinned.canon_target.to_string_lossy().into_owned(),
         bytes_written: content.len() as u64,
         content_sha256: content_sha256.to_string(),
         restore: RestoreHandle {
@@ -145,54 +160,88 @@ fn execute_create(
     })
 }
 
-/// `Overwrite`: snapshot (step 4) then atomic-rename write (step 5).
+/// `Overwrite`: snapshot (step 4) then atomic-rename write (step 5). Every
+/// reference to the target is fd-relative; the path string is not resolved
+/// again.
 fn execute_overwrite(
-    target: &Path,
+    pinned: &PinnedParent,
     content: &[u8],
     content_sha256: &str,
     handle: &str,
     request: RequestId,
     snapshots_dir: &Path,
 ) -> Result<WriteOutcome, WriteError> {
-    let dir = target
-        .parent()
-        .ok_or_else(|| WriteError::Write("target has no parent directory".into()))?;
+    let name = &pinned.target_name;
 
-    // Step 4: the snapshot. Failure means no write is attempted — the
-    // target must remain exactly as it was.
+    // Step 4a: open the target through the pin. `O_NOFOLLOW` refuses a
+    // symlink planted at the target after authorization.
+    let target_fd = fsat::openat(&pinned.fd, name, libc::O_RDONLY | libc::O_NOFOLLOW, 0)
+        .map_err(|e| match e.raw_os_error() {
+            Some(libc::ENOENT) => {
+                WriteError::Snapshot("target does not exist (mode Overwrite)".into())
+            }
+            Some(libc::ELOOP) => WriteError::Snapshot(
+                "target is a symlink at effect time (swapped after authorization)".into(),
+            ),
+            _ => WriteError::Snapshot(format!("open target: {e}")),
+        })?;
+    let target_stat = fsat::fstat(&target_fd)
+        .map_err(|e| WriteError::Snapshot(format!("stat target: {e}")))?;
+    if !fsat::is_regular(&target_stat) {
+        return Err(WriteError::Snapshot(
+            "target is not a regular file at effect time".into(),
+        ));
+    }
+
+    // Step 4b: the snapshot is a COW clone of the *opened file* — never of
+    // whatever a re-resolved path string would refer to. `fclonefileat(2)`
+    // names the destination relative to the (trusted) snapshots dir fd.
+    // Failure means no write is attempted — the target must remain exactly
+    // as it was.
     let snapshot_path = snapshots_dir.join(handle);
-    clonefile(target, &snapshot_path).map_err(|e| {
-        WriteError::Snapshot(format!("clonefile {} → {}: {e}", target.display(), snapshot_path.display()))
-    })?;
+    let snap_dir = fsat::open_dir(snapshots_dir)
+        .map_err(|e| WriteError::Snapshot(format!("open snapshots dir: {e}")))?;
+    let snap_name = handle.as_bytes().to_vec();
+    fsat::clone_to_dir_fd(&target_fd, &snap_dir, &snap_name)
+        .map_err(|e| WriteError::Snapshot(map_clone_error(&e)))?;
+    drop(snap_dir);
+    // Explicit 0600: the snapshot holds the pre-image of agent-written
+    // content. The state directory is 0700 (defense in depth), but the file
+    // mode is stated, not inherited from the source.
+    if let Err(e) = std::fs::set_permissions(&snapshot_path, std::fs::Permissions::from_mode(0o600)) {
+        tracing::warn!("snapshot chmod 0600 failed (state dir is 0700): {e}");
+    }
+    drop(target_fd);
 
     // Preserve the target's permission bits on the replacement.
-    let target_mode = std::fs::metadata(target)
-        .map(|m| m.permissions().mode() & 0o0777)
-        .unwrap_or(0o644);
+    let target_mode = target_stat.st_mode & 0o0777;
 
-    // Step 5: temp file in the same directory (same volume), written
-    // fully and fsynced before the atomic rename.
-    let basename = target
+    // Step 5: temp file in the pinned directory (same volume), written fully
+    // and fsynced before the atomic `renameat` over the target.
+    let basename = pinned
+        .canon_target
         .file_name()
         .map(|b| b.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let temp = dir.join(format!(".{basename}.ramen-tmp.{request}"));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(target_mode)
-        .open(&temp)
-        .map_err(|e| WriteError::Write(format!("open temp: {e}")))?;
+    let temp_name = format!(".{basename}.ramen-tmp.{request}");
+    let temp_bytes = temp_name.into_bytes();
+    let mut file = fsat::openat(
+        &pinned.fd,
+        &temp_bytes,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+        target_mode,
+    )
+    .map_err(|e| WriteError::Write(format!("open temp: {e}")))?;
 
     if let Err(e) = write_and_sync(&mut file, content) {
-        let _ = std::fs::remove_file(&temp);
+        let _ = fsat::unlinkat(&pinned.fd, &temp_bytes);
         return Err(WriteError::Write(format!("write: {e}")));
     }
-    if let Err(e) = std::fs::rename(&temp, target) {
-        let _ = std::fs::remove_file(&temp);
+    if let Err(e) = fsat::renameat(&pinned.fd, &temp_bytes, name) {
+        let _ = fsat::unlinkat(&pinned.fd, &temp_bytes);
         return Err(WriteError::Write(format!("rename: {e}")));
     }
-    if let Err(e) = fsync_dir(dir) {
+    if let Err(e) = fsat::fsync_dir_fd(&pinned.fd) {
         // The rename already landed; a lost directory fsync is logged
         // upstream, not a failed write.
         tracing::warn!("overwrite: directory fsync failed: {e}");
@@ -203,7 +252,7 @@ fn execute_overwrite(
     // On success it is the restore point.
 
     Ok(WriteOutcome {
-        canonical: target.to_string_lossy().into_owned(),
+        canonical: pinned.canon_target.to_string_lossy().into_owned(),
         bytes_written: content.len() as u64,
         content_sha256: content_sha256.to_string(),
         restore: RestoreHandle {
@@ -215,17 +264,23 @@ fn execute_overwrite(
     })
 }
 
-/// Write all bytes and `fsync` the file.
-fn write_and_sync(file: &mut File, content: &[u8]) -> std::io::Result<()> {
+/// `EXDEV` gets a stable message (no raw errno to the client); everything
+/// else is a mechanism failure and is reported as such.
+fn map_clone_error(e: &std::io::Error) -> String {
+    if e.raw_os_error() == Some(libc::EXDEV) {
+        "target is on a different volume than the state directory; v0 requires both on the same APFS volume"
+            .to_string()
+    } else {
+        format!("clone: {e}")
+    }
+}
+
+/// Write all bytes, then `fsync` the file (durability: the bytes are on
+/// stable storage, not just in the page cache).
+fn write_and_sync(file: &mut std::fs::File, content: &[u8]) -> std::io::Result<()> {
     file.write_all(content)?;
     file.sync_all()?;
     Ok(())
-}
-
-/// `fsync` a directory (durable metadata: creates, renames, unlinks).
-fn fsync_dir(dir: &Path) -> std::io::Result<()> {
-    let d = OpenOptions::new().read(true).open(dir)?;
-    d.sync_all()
 }
 
 /// SHA-256 of `bytes`, lowercase hex.
@@ -295,6 +350,11 @@ pub fn authorized_detail(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn pin(target: &Path) -> PinnedParent {
+        fsat::pin_parent(target).unwrap()
+    }
 
     #[test]
     fn sanitize_replaces_outside_charset() {
@@ -328,15 +388,24 @@ mod tests {
 
         let s = SessionId::new();
         let r = RequestId::new();
-        let out = execute(&target, b"hello", WriteMode::Create, s, r, dir.path()).unwrap();
+        let pinned = pin(&target);
+        let out = execute_pinned(&pinned, b"hello", WriteMode::Create, s, r, dir.path()).unwrap();
         assert_eq!(out.bytes_written, 5);
         assert!(out.snapshot.is_none(), "Create has no snapshot file");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello");
 
         // Second Create on the same path: O_EXCL refusal, target untouched.
         let before = std::fs::read_to_string(&target).unwrap();
-        let err = execute(&target, b"other", WriteMode::Create, s, RequestId::new(), dir.path())
-            .unwrap_err();
+        let pinned = pin(&target);
+        let err = execute_pinned(
+            &pinned,
+            b"other",
+            WriteMode::Create,
+            s,
+            RequestId::new(),
+            dir.path(),
+        )
+        .unwrap_err();
         assert!(matches!(err, WriteError::Write(_)), "{err:?}");
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
@@ -355,7 +424,9 @@ mod tests {
 
         let s = SessionId::new();
         let r = RequestId::new();
-        let out = execute(&target, b"replaced", WriteMode::Overwrite, s, r, &snapshots).unwrap();
+        let pinned = pin(&target);
+        let out = execute_pinned(&pinned, b"replaced", WriteMode::Overwrite, s, r, &snapshots)
+            .unwrap();
 
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "replaced");
         let snap = out.snapshot.as_ref().expect("Overwrite takes a snapshot");
@@ -373,14 +444,40 @@ mod tests {
     }
 
     #[test]
+    fn overwrite_snapshot_is_mode_0600() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshots = dir.path().join("snapshots");
+        std::fs::create_dir_all(&snapshots).unwrap();
+        let target = dir.path().join("f.txt");
+        std::fs::write(&target, b"original").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let pinned = pin(&target);
+        let out = execute_pinned(
+            &pinned,
+            b"replaced",
+            WriteMode::Overwrite,
+            SessionId::new(),
+            RequestId::new(),
+            &snapshots,
+        )
+        .unwrap();
+
+        let snap = out.snapshot.unwrap();
+        let mode = std::fs::metadata(&snap).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "snapshot must be explicitly 0600, not the source's mode");
+    }
+
+    #[test]
     fn overwrite_on_missing_target_fails_at_snapshot_without_creating() {
         let dir = tempfile::tempdir().unwrap();
         let snapshots = dir.path().join("snapshots");
         std::fs::create_dir_all(&snapshots).unwrap();
         let target = dir.path().join("missing.txt");
 
-        let err = execute(
-            &target,
+        let pinned = pin(&target);
+        let err = execute_pinned(
+            &pinned,
             b"x",
             WriteMode::Overwrite,
             SessionId::new(),
@@ -393,6 +490,34 @@ mod tests {
     }
 
     #[test]
+    fn overwrite_rejects_symlink_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshots = dir.path().join("snapshots");
+        std::fs::create_dir_all(&snapshots).unwrap();
+        let target = dir.path().join("link.txt");
+        let decoy = dir.path().join("decoy.txt");
+        std::fs::write(&decoy, b"decoy").unwrap();
+        std::os::unix::fs::symlink(&decoy, &target).unwrap();
+
+        let pinned = pin(&target);
+        let err = execute_pinned(
+            &pinned,
+            b"x",
+            WriteMode::Overwrite,
+            SessionId::new(),
+            RequestId::new(),
+            &snapshots,
+        )
+        .unwrap_err();
+        assert!(matches!(err, WriteError::Snapshot(_)), "{err:?}");
+        assert_eq!(
+            std::fs::read(&decoy).unwrap(),
+            b"decoy",
+            "the symlink's referent must be untouched"
+        );
+    }
+
+    #[test]
     fn overwrite_preserves_target_mode() {
         let dir = tempfile::tempdir().unwrap();
         let snapshots = dir.path().join("snapshots");
@@ -401,8 +526,9 @@ mod tests {
         std::fs::write(&target, b"old").unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
 
-        execute(
-            &target,
+        let pinned = pin(&target);
+        execute_pinned(
+            &pinned,
             b"new",
             WriteMode::Overwrite,
             SessionId::new(),
@@ -413,5 +539,23 @@ mod tests {
 
         let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o0777;
         assert_eq!(mode, 0o640, "overwrite must preserve the target's mode");
+    }
+
+    #[test]
+    fn clone_error_exdev_maps_to_stable_message() {
+        let e = std::io::Error::from_raw_os_error(libc::EXDEV);
+        let msg = map_clone_error(&e);
+        assert!(
+            msg.contains("different volume"),
+            "EXDEV must not leak a raw errno: {msg}"
+        );
+        assert!(!msg.contains("os error"), "no errno in the message: {msg}");
+    }
+
+    #[test]
+    fn clone_error_other_keeps_detail() {
+        let e = std::io::Error::from_raw_os_error(libc::EACCES);
+        let msg = map_clone_error(&e);
+        assert!(msg.contains("clone:"), "{msg}");
     }
 }

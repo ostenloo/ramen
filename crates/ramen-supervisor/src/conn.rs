@@ -405,7 +405,7 @@ impl Connection {
     ///     summary), audited `Executed` (`05-operations.md` M5).
     ///   - `FileWrite` (M6): pre-effect validations, audited
     ///     `Authorized` with the snapshot path and content hash, the
-    ///     `clonefile` snapshot + atomic write, then `Executed` or
+    ///     `fclonefileat(2)` snapshot + atomic write, then `Executed` or
     ///     `ExecutionFailed` (`05-operations.md` M6).
     /// - A decision that cannot be audited is refused
     ///   (`Error/AuditUnavailable`) — invariant 4.
@@ -578,16 +578,21 @@ impl Connection {
     /// Order (load-bearing):
     /// 1. base64 decode + 256 KiB cap — a failure must happen *before* the
     ///    `Authorized` record (`Errored`/`MalformedRequest`).
-    /// 2. Fresh canonicalization of the target (the guard checked the path
-    ///    at authorize time; re-resolving now keeps the documented race
-    ///    window between authorization and effect narrow and yields the
-    ///    canonical string for the response and the audit).
+    /// 2. Pin the parent directory (`fsat::pin_parent`): resolved exactly
+    ///    once, the opened fd verified to be that directory by device +
+    ///    inode. Every syscall of the effect then runs `*at`-relative to
+    ///    the pin, so a path-component swap timed anywhere after the pin
+    ///    cannot steer the write (the guard checked the path at authorize
+    ///    time; the pin closes the window between authorization and effect
+    ///    and yields the canonical string for the response and the audit).
     /// 3. Supervisor-level bound: the target must fall within a configured
-    ///    `allowed_prefixes` entry. A miss is `Denied`/`ConstraintViolated`
-    ///    with **no** `Authorized` record (the decision boundary refused).
+    ///    `allowed_prefixes` entry — checked against the *pinned*
+    ///    resolution, i.e. the directory the effect actually writes.
+    ///    A miss is `Denied`/`ConstraintViolated` with **no** `Authorized`
+    ///    record (the decision boundary refused).
     /// 4. `Authorized` `{mode, content_sha256, snapshot_path}` — durable
     ///    before any effect, including the snapshot (invariant 4).
-    /// 5. The effect (`filewrite::execute`), then `Executed` or
+    /// 5. The effect (`filewrite::execute_pinned`), then `Executed` or
     ///    `ExecutionFailed` (invariant 7: every `Authorized` gets a
     ///    terminal record).
     async fn filewrite_effect(effect: &Effect, fw: &FileWriteOp) -> Response {
@@ -628,46 +633,30 @@ impl Connection {
             }
         };
 
-        // (2) Fresh canonicalization: resolve the *parent* and re-join the
-        // final component (the guard's own resolution). A full
-        // `canonicalize` of the target would fail for `Create`, whose target
-        // does not exist yet; the final component is never a symlink (the
-        // guard refused that), so parent + name is the canonical target.
+        // (2) Pin the parent directory (`05-operations.md` M6 step 2).
+        // Without this, each effect syscall (snapshot, temp open, rename)
+        // would re-resolve the path string independently — every
+        // re-resolution is a window in which an agent with write access to
+        // an intermediate directory can swap a path component and steer the
+        // write away from the checked directory, including outside the
+        // configured prefixes of step (3). The pin makes the bound hold
+        // against the directory that is actually written.
         let target_path = std::path::Path::new(&fw.path);
-        let canon = match target_path.parent() {
-            Some(parent) => match std::fs::canonicalize(parent) {
-                Ok(canon_parent) => match target_path.file_name() {
-                    Some(name) => canon_parent.join(name),
-                    None => {
-                        return Self::authorized_then_execution_failed(
-                            effect,
-                            &filewrite::authorized_detail(fw, &content, None),
-                            "target path has no final component",
-                        )
-                        .await;
-                    }
-                },
-                Err(e) => {
-                    // The target's parent disappeared between authorization
-                    // and effect. The decision was made and is audited
-                    // `Authorized`; the effect failed.
-                    return Self::authorized_then_execution_failed(
-                        effect,
-                        &filewrite::authorized_detail(fw, &content, None),
-                        &format!("target no longer resolvable: {e}"),
-                    )
-                    .await;
-                }
-            },
-            None => {
+        let pinned = match crate::fsat::pin_parent(target_path) {
+            Ok(p) => p,
+            Err(e) => {
+                // The target's parent disappeared (or was swapped) between
+                // authorization and effect. The decision was made and is
+                // audited `Authorized`; the effect failed.
                 return Self::authorized_then_execution_failed(
                     effect,
                     &filewrite::authorized_detail(fw, &content, None),
-                    "target path has no parent",
+                    &e.to_string(),
                 )
                 .await;
             }
         };
+        let canon = &pinned.canon_target;
 
         // (3) Supervisor-level bound: the target must fall within a
         // configured allowed prefix. (The token's `allowed_prefix` facts
@@ -677,7 +666,7 @@ impl Connection {
             .ctx
             .config_prefixes
             .iter()
-            .any(|p| starts_within(&canon, p))
+            .any(|p| starts_within(canon, p))
         {
             let record = NewRecord {
                 kind: RecordKind::Denied,
@@ -716,7 +705,7 @@ impl Connection {
         // snapshot. `snapshot_path` is deterministic, so it is known before
         // the snapshot exists (`05-operations.md` M6 step 4).
         let snapshot_name =
-            filewrite::snapshot_handle_name(&canon, effect.session, effect.req.id);
+            filewrite::snapshot_handle_name(canon, effect.session, effect.req.id);
         let snapshot_path = (fw.mode == WriteMode::Overwrite)
             .then(|| effect.ctx.snapshots_dir.join(&snapshot_name));
         let detail = filewrite::authorized_detail(fw, &content, snapshot_path.as_deref());
@@ -745,14 +734,18 @@ impl Connection {
         // Test-only hook: pause after the `Authorized` record is durable but
         // before the effect runs. The crash-window test (SIGKILL between
         // authorization and write, `02-audit.md` §8) relies on this.
-        if std::env::var_os("RAMEN_TEST_PAUSE_AFTER_AUTHORIZED").is_some() {
-            tracing::info!("test hook: pausing after Authorized for FileWrite {}", effect.req.id);
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        if let Some(v) = std::env::var_os("RAMEN_TEST_PAUSE_AFTER_AUTHORIZED") {
+            // Test hook: pause (seconds) between the durable `Authorized`
+            // record and the effect. Unparseable values default to 60s.
+            let secs = v.to_string_lossy().parse::<u64>().unwrap_or(60);
+            tracing::info!("test hook: pausing {secs}s after Authorized for FileWrite {}", effect.req.id);
+            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
         }
 
-        // (5) The effect, then the terminal record.
-        match filewrite::execute(
-            &canon,
+        // (5) The effect, then the terminal record. Every syscall is
+        // `*at`-relative to `pinned`.
+        match filewrite::execute_pinned(
+            &pinned,
             &content,
             fw.mode,
             effect.session,
