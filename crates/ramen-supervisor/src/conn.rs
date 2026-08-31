@@ -338,13 +338,17 @@ impl Connection {
                     }
                     Message::Request(req) => {
                         if req.v != PROTOCOL_VERSION {
+                            // A request carries an id, so the client is told
+                            // about the mismatch with an `Error` response for
+                            // that id — not a `Fault` — before the connection
+                            // is closed (`01-protocol.md` §4).
                             return self
-                                .violation(
+                                .request_version_mismatch(
+                                    &req,
                                     &format!(
                                         "version mismatch: got {}, expected {PROTOCOL_VERSION}",
                                         req.v
                                     ),
-                                    ErrorCode::VersionMismatch,
                                 )
                                 .await;
                         }
@@ -964,6 +968,30 @@ impl Connection {
 
         let fault = Fault::new(code, format!("protocol violation: {reason}"));
         let _ = self.tx.try_send(Message::Fault(fault));
+        CloseReason::Violation
+    }
+
+    /// Post-handshake `v` mismatch on a request: audit as
+    /// `ProtocolViolation`, answer the request with
+    /// `Error/VersionMismatch` (it has an id, so `Error` can name it —
+    /// `01-protocol.md` §4), then close.
+    async fn request_version_mismatch(&mut self, req: &Request, reason: &str) -> CloseReason {
+        let record = NewRecord {
+            kind: RecordKind::ProtocolViolation,
+            session: self.session,
+            identity: self.identity.clone(),
+            peer: Some(self.peer.clone()),
+            request_id: Some(req.id),
+            op_type: None,
+            reversibility: None,
+            detail: serde_json::json!({ "reason": reason }),
+            client: None,
+        };
+        if let Err(e) = self.ctx.audit.append(&record).await {
+            tracing::error!("violation audit failed: {e}");
+        }
+        let response = Response::error(req.id, ErrorCode::VersionMismatch, reason);
+        let _ = self.tx.try_send(Message::Response(response));
         CloseReason::Violation
     }
 

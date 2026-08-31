@@ -159,6 +159,9 @@ fn request_id_reuse_rejected() {
 
 #[test]
 fn version_mismatch_on_request_rejected() {
+    // `01-protocol.md` §4: a mismatch on a *request* (which carries an id)
+    // produces `Error/VersionMismatch` for that id, then the connection
+    // closes. (A mismatch on `Hello` gets a `Fault` — no id exists yet.)
     let mut sup = common::Supervisor::start();
     let mut client = handshaken(&sup);
     let req = ramen_proto::Request::new(ramen_proto::Operation::Whoami(
@@ -172,7 +175,25 @@ fn version_mismatch_on_request_rejected() {
     buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     buf.extend_from_slice(&payload);
     client.send_raw(&buf);
-    assert_violation(&mut client, ErrorCode::VersionMismatch, &sup);
+
+    let resp = client.recv().expect("Error response for version mismatch");
+    match resp {
+        Message::Response(ramen_proto::Response::Error { id, error, .. }) => {
+            assert_eq!(id, req.id, "response must name the request");
+            assert_eq!(error.code, ErrorCode::VersionMismatch, "error code");
+        }
+        other => panic!("expected Error/VersionMismatch, got {other:?}"),
+    }
+    assert!(client.recv().is_none(), "connection must be closed");
+
+    let records = sup.audit_records();
+    assert!(
+        records.iter().any(|r| {
+            matches!(r, ramen_audit::Record::Event(e)
+                if e.kind == RecordKind::ProtocolViolation && e.session.is_some())
+        }),
+        "post-handshake version mismatch must be audited with a session"
+    );
     drop(client);
     sup.terminate_and_wait();
 }

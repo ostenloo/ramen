@@ -39,7 +39,7 @@ the SDK from acquiring CLI-shaped assumptions.
 pub struct Client { /* ... */ }
 
 impl Client {
-    pub async fn connect(socket: &Path, token: &Biscuit) -> Result<Self, SdkError>;
+    pub async fn connect(socket: &Path, token: &UnverifiedBiscuit) -> Result<Self, SdkError>;
 
     pub fn session(&self) -> SessionId;
     pub fn identity(&self) -> &str;
@@ -51,8 +51,16 @@ impl Client {
 pub enum OpOutcome {
     Ok(serde_json::Value),
     Denied { code: DenialCode, reason: String, audit_seq: u64 },
+    Error { code: ErrorCode, message: String },
 }
 ```
+The token type is `UnverifiedBiscuit`, not `Biscuit`: in biscuit-auth, `Biscuit`
+is a *verified* token — its constructors validate the signature against the
+root key — and a client never holds the root key, only the supervisor and the
+minter do. The client parses the base64 text into an unverified biscuit and
+hands it to the supervisor, which performs the verification at handshake
+(`04-guard.md` §3). A client-side "verified" type would have no valid way to
+be constructed.
 
 Three things about this signature:
 
@@ -61,6 +69,16 @@ produced a policy answer. Putting it in the error variant means every `?` in
 consumer code treats a denial as a transport failure, and consumers stop
 distinguishing them. `SdkError` is for transport, framing, and handshake
 failures only.
+
+**`Error` is an outcome, not an `SdkError`.** The `Error` status is one of the
+three terminal responses (`01-protocol.md` §7): the round trip succeeded, the
+request was matched by id, and the supervisor reported a machinery failure.
+It is the request-scoped counterpart of `Denied` — a system answer, not a
+transport failure. Surfacing it as `SdkError` would make every `?` in consumer
+code treat "the supervisor executed and told me this operation failed" as
+"I couldn't reach the supervisor", and a consumer that retries transport
+failures would retry an operation the supervisor already reported as failed.
+It is a third `OpOutcome` variant for the same reason `Denied` is one.
 
 **Unknown statuses are transport errors.** v0 has exactly three terminal
 statuses (`01-protocol.md` §7). An unrecognized status — for example a future
