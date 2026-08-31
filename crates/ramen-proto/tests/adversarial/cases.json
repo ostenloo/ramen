@@ -63,6 +63,10 @@
     {
       "file": "valid_error_audit_unavailable.json",
       "expect": "accept"
+    },
+    {
+      "file": "ok_empty_result.json",
+      "expect": "reject"
     }
   ]
 }

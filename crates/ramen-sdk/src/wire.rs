@@ -201,7 +201,8 @@ impl Request {
 #[serde(tag = "status")]
 pub enum Response {
     /// `result` is op-specific and passed through as JSON (the SDK does not
-    /// model the result payload per the spec §2 `OpOutcome::Ok(Value)`).
+    /// model the result payload per the spec §2 `OpOutcome::Ok(Value)`),
+    /// but it must be a *legal v0 result shape* — see `validate_ok_result`.
     Ok {
         v: u16,
         id: RequestId,
@@ -217,6 +218,73 @@ pub enum Response {
         id: RequestId,
         error: ErrorInfo,
     },
+}
+
+// ── Ok result-shape validation ────────────────────────────────────────────
+//
+// `OpOutcome::Ok(Value)` hands the result to clients opaquely, so the SDK
+// does not *model* it. But the *parser* must reject results that are not
+// legal v0 frames: an opaque `Value` would accept anything JSON-shaped, and
+// `{}` is not a legal v0 result (the first sweep of the spec examples
+// found the SDK accepting it while `ramen-proto` rejected it). The two
+// shapes below are the v0 result payloads (`05-operations.md` §3),
+// independently defined here. When a new operation ships with a new result
+// shape, this must grow with it — and the corpus must pin the new shape.
+
+// Validation-only types: the deserializer writes them, no code reads a field,
+// so the fields are dead by construction.
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OkResultShape {
+    Whoami(WhoamiResultShape),
+    FileWrite(FileWriteResultShape),
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WhoamiResultShape {
+    identity: String,
+    session: SessionId,
+    capabilities: Vec<CapabilitySummary>,
+    token_expires_at: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileWriteResultShape {
+    path: String,
+    bytes_written: u64,
+    content_sha256: String,
+    restore: RestoreHandleShape,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestoreHandleShape {
+    kind: RestoreKindShape,
+    handle: String,
+    reversibility: Reversibility,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+enum RestoreKindShape {
+    Snapshot,
+}
+
+fn validate_ok_result(result: &serde_json::Value) -> Result<(), WireError> {
+    serde_json::from_value::<OkResultShape>(result.clone())
+        .map_err(|e| {
+            WireError::Json(format!(
+                "`result` is not a legal v0 shape (Whoami or FileWrite): {e}"
+            ))
+        })
+        .map(|_| ())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -410,6 +478,9 @@ impl Message {
                     }
                 }
                 let r: Response = serde_json::from_value(value).map_err(json_err)?;
+                if let Response::Ok { result, .. } = &r {
+                    validate_ok_result(result)?;
+                }
                 return Ok(Message::Response(r));
             }
         }
@@ -593,14 +664,39 @@ mod tests {
     #[test]
     fn response_variants_dispatch_by_status() {
         let ok: serde_json::Value = serde_json::from_str(
-            r#"{"status":"Ok","v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","result":{}}"#
-        ).unwrap();
+            r#"{"status":"Ok","v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","result":{"identity":"agent:planner","session":"01ARZ3NDEKTSV4RRFFQ69G5FAV","capabilities":[],"token_expires_at":null}}"#
+        )
+        .unwrap();
         assert!(matches!(Message::from_value(ok).unwrap(), Message::Response(Response::Ok { .. })));
 
         let err: serde_json::Value = serde_json::from_str(
             r#"{"status":"Error","v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","error":{"code":"Internal","message":"x"}}"#
-        ).unwrap();
+        )
+        .unwrap();
         assert!(matches!(Message::from_value(err).unwrap(), Message::Response(Response::Error { .. })));
+    }
+
+    #[test]
+    fn ok_result_must_be_a_legal_v0_shape() {
+        let mk = |result: &str| {
+            serde_json::from_str(&format!(
+                r#"{{"status":"Ok","v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","result":{result}}}"#,
+            ))
+            .unwrap()
+        };
+        // `{}` is not a legal v0 result — the opaque-Value laxness this
+        // validator closes. Unknown fields and wrong shapes are equally
+        // illegal.
+        assert!(Message::from_value(mk("{}")).is_err());
+        assert!(Message::from_value(mk(r#"{"junk":1}"#)).is_err());
+        assert!(Message::from_value(mk(r#"[1,2,3]"#)).is_err());
+        // Both v0 shapes parse.
+        assert!(Message::from_value(
+            mk(r#"{"identity":"agent:planner","session":"01ARZ3NDEKTSV4RRFFQ69G5FAV","capabilities":[{"op":"Whoami","reversibility":"Trivial"}],"token_expires_at":null}"#)
+        ).is_ok());
+        assert!(Message::from_value(
+            mk(r#"{"path":"/x/f.txt","bytes_written":3,"content_sha256":"a3f1e2c9","restore":{"kind":"Snapshot","handle":"h","reversibility":"Trivial"}}"#)
+        ).is_ok());
     }
 
     #[test]
