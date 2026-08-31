@@ -1,0 +1,18 @@
+[package]
+name = "ramen-guard"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Exact pin (00-overview.md Dependencies; M0 spike). The guard is the only
+# other crate that touches biscuit directly, besides the supervisor's
+# handshake and ramen-mint.
+biscuit-auth = { workspace = true }
+# Wire types only: Operation, Reversibility, DenialCode, CapabilitySummary,
+# Constraints. No I/O types.
+ramen-proto = { path = "../ramen-proto" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Test-only: temp dirs for the FileRootKey load tests.
+tempfile = { workspace = true }

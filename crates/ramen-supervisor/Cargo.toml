@@ -1,0 +1,45 @@
+[package]
+name = "ramen-supervisor"
+version.workspace = true
+edition.workspace = true
+description = "Ramen control-plane supervisor (M4: identity, handshake, guard authorization, no operations yet)"
+
+[lib]
+name = "ramen_supervisor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ramen-supervisor"
+path = "src/main.rs"
+
+[dependencies]
+ramen-proto = { path = "../ramen-proto" }
+ramen-audit = { path = "../ramen-audit" }
+ramen-guard = { path = "../ramen-guard" }
+biscuit-auth = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Spec 00-overview.md: the supervisor may use the tokio runtime; ramen-audit
+# itself stays sync-only. `signal` gives SIGTERM/SIGINT without any unsafe in
+# this crate (tokio owns the self-pipe internally); `time` provides the
+# bounded shutdown deadline.
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "io-util", "sync", "macros", "time", "signal"] }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+libc = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+security-framework = { workspace = true }
+core-foundation = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+futures = { workspace = true }
+libc = { workspace = true }
+base64 = { workspace = true }
+ramen-proto = { path = "../ramen-proto" }
+ramen-audit = { path = "../ramen-audit" }
+biscuit-auth = { workspace = true }
+serde_json = { workspace = true }

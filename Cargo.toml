@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ramen-proto",
+    "crates/ramen-audit",
+    "crates/ramen-guard",
+    "crates/ramen-supervisor",
+    "cli/ramen-mint",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+# Exact pin: M0 spike verified against 6.0.0 (spec 00-overview.md, M0).
+# P-256 / secp256r1 support requires 6.x; do not bump without re-running the
+# spike and re-checking 04-guard.md §1 (check-clause semantics).
+biscuit-auth = "=6.0.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+ulid = { version = "1", features = ["serde"] }
+sha2 = "0.10"
+base64 = "0.22"
+libc = "0.2"
+tokio = { version = "1", features = ["sync"] }
+# Test-only: drives async `append` futures from plain test threads without a
+# tokio runtime (the library itself needs only `sync`).
+futures = { version = "0.3", features = ["executor"] }
+# M3: supervisor runtime
+# core-foundation must match security-framework's own dependency (0.9.x) so
+# the CF types are identical across the boundary.
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+security-framework = "2.11"
+core-foundation = "0.9"
+# Test-only
+tempfile = "3"

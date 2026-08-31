@@ -1,0 +1,10 @@
+[package]
+name = "ramen-mint"
+description = "Out-of-band token minter for Ramen (root key management + Biscuit tokens)"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+biscuit-auth = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+time = { version = "0.3", features = ["parsing", "formatting"] }

@@ -1,0 +1,1 @@
+{"status":"Ok","v":1,"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","result":{"identity":"agent:planner","session":"01ARZ3NDEKTSV4RRFFQ69G5FAV","capabilities":[{"op":"Whoami","reversibility":"Trivial"},{"op":"FileWrite","reversibility":"Trivial","constraints":{"path_prefix":["/Users/austin/work"]}}],"token_expires_at":"2026-08-31T00:00:00Z"}}

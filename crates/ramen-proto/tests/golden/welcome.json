@@ -1,0 +1,1 @@
+{"v":1,"type":"Welcome","session":"01ARZ3NDEKTSV4RRFFQ69G5FAV","identity":"agent:planner","capabilities":[{"op":"Whoami","reversibility":"Trivial"},{"op":"FileWrite","reversibility":"Trivial","constraints":{"path_prefix":["/Users/austin/work"]}}]}

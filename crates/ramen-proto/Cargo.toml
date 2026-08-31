@@ -1,0 +1,15 @@
+[package]
+name = "ramen-proto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+# No dev-dependencies: the M1 property tests are hand-rolled (the crate's
+# dependency set is capped at serde / serde_json / thiserror / ulid, and the
+# same cap is asserted for dev-dependencies in the M1 acceptance).
