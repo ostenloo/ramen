@@ -118,7 +118,6 @@ network:
   allowed:
     - defaults
     - 172.17.0.1
-    - http://172.17.0.1  # http-scheme form: the AWF binary/squid ACL compares the target string as written; the api-proxy dials http://<host> port 80 and Caddy on the runner host routes /v1/* to vLLM:8000
 
 tools:
   bash: true
