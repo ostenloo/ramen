@@ -58,6 +58,18 @@ on:
             core.setOutput('has_issues', 'false');
           }
 
+jobs:
+  pre-activation:
+    # Re-expose the search step's outputs as job outputs — without this the
+    # step's core.setOutput values die with the step and has_issues is never
+    # visible to the agent job's if: condition.
+    outputs:
+      has_issues: ${{ steps.search.outputs.has_issues }}
+      issue_number: ${{ steps.search.outputs.issue_number }}
+      issue_title: ${{ steps.search.outputs.issue_title }}
+      issue_url: ${{ steps.search.outputs.issue_url }}
+      issue_body: ${{ steps.search.outputs.issue_body }}
+
 engine:
   id: copilot
   env:
