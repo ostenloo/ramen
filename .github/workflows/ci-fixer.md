@@ -59,6 +59,7 @@ on:
           }
 
 permissions:
+  copilot-requests: write
   contents: read
   issues: read
   pull-requests: read
