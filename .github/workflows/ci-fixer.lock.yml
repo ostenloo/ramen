@@ -886,7 +886,12 @@ jobs:
           fi
 
           # Export gateway environment variables for MCP config and gateway script
-          export MCP_GATEWAY_PORT="8080"
+          # POST-COMPILE PATCH — do not run `gh aw compile` without re-applying.
+          # The generator hardcodes host port 8080 for the MCP gateway container,
+          # which is occupied by the mirgenta-server container on this self-hosted
+          # runner's host. 18080 is free and propagates to both the docker -p
+          # mapping and the host-side gateway URL via this single export.
+          export MCP_GATEWAY_PORT="18080"
           export MCP_GATEWAY_DOMAIN="awmg-mcpg"
           export MCP_GATEWAY_HOST_DOMAIN="localhost"
           MCP_GATEWAY_AGENT_ID=$(openssl rand -base64 45 | tr -d '/+=')
