@@ -287,6 +287,7 @@ Denial codes (closed set; add variants deliberately):
 | `ReversibilityNotPermitted` | Token does not authorize this reversibility class. |
 | `ControlPlaneProtected` | Target resolves inside Ramen's own state. Invariant 5. |
 | `TokenExpired` | Token failed a time-based check. |
+| `TokenRejected` | The engine surfaced a token-derived fault (format, encoding, datalog, or an unevaluatable internal expression): the token is rejected, like one with a bad signature. Assigned without classification probes (`04-guard.md` §5). |
 
 ```json
 {
@@ -298,7 +299,8 @@ Denial codes (closed set; add variants deliberately):
 ```
 
 Error codes: `VersionMismatch`, `MalformedRequest`, `NotImplemented`,
-`IdentityUnverifiable`, `AuditUnavailable`, `ExecutionFailed`, `Internal`.
+`IdentityUnverifiable`, `AuditUnavailable`, `EvaluationIncomplete`,
+`ExecutionFailed`, `Internal`.
 
 **The code sets are closed, per protocol version.** Both the denial codes
 and the error codes are closed sets for v0: the lists above are normative, and
@@ -314,6 +316,20 @@ process fatal (`00-overview.md` invariant 4), so a client whose audit-append
 just failed sees a closed connection, not this code. The code stays in the set
 so a client built against this version remains forward-compatible with a
 supervisor that might one day answer rather than exit.
+
+`EvaluationIncomplete` is the wire form of the guard's `Indeterminate`
+outcome (`04-guard.md` §9): the authorization evaluation could not complete
+(engine limit, engine error) and the operation was refused — **not** a
+denial. A client must treat it as a transient refusal: the token may be
+perfectly good. But it must not retry *immediately and unboundedly*: the code
+fires precisely when the supervisor is under resource pressure, so immediate
+blind retries form a feedback loop that lands the retry storm at the worst
+moment. The required client behavior is **exponential backoff with jitter,
+a bounded number of attempts, and a terminal error after the cap** (the
+SDK surfaces the final failure rather than looping forever); an operator
+checking the supervisor's load is the other half of the response. A token
+re-issue is not a retry: it does not change what the evaluator was unable to
+finish.
 
 **`message` must never contain data derived from the operation's target
 contents.** It may name a path the client already supplied; it must not contain

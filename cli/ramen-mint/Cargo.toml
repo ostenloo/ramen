@@ -8,3 +8,9 @@ edition.workspace = true
 biscuit-auth = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 time = { version = "0.3", features = ["parsing", "formatting"] }
+
+[dev-dependencies]
+# Test-only: e2e_guard.rs runs the real minter binary against the real guard.
+ramen-guard = { path = "../../crates/ramen-guard" }
+ramen-proto = { path = "../../crates/ramen-proto" }
+tempfile = { workspace = true }

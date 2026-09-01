@@ -108,6 +108,7 @@ All subsequent records:
 | `IdentityRejected` | Peer identity could not be verified. No session exists yet. |
 | `Authorized` | Guard permitted. Written **before** any effect, including the snapshot. |
 | `Denied` | Guard refused. Carries the denial code. |
+| `Indeterminate` | The guard could not reach a decision: the authorization evaluation itself failed (engine limit, engine error). The operation was refused; this is **not** a `Denied`. Carries the reason, the limits the evaluation ran under, the session's consecutive-indeterminate count, and the supervisor-wide one (both advisory — see below). |
 | `Errored` | A non-fatal `Error` response was sent to the client (e.g., `NotImplemented` in M3). |
 | `Executed` | Effect completed. Carries outcome and any restore handle. |
 | `ExecutionFailed` | Effect attempted and failed. |
@@ -119,6 +120,19 @@ any effect, `Executed` or `ExecutionFailed` after. This is what makes invariant
 2 checkable — an `Authorized` with no following terminal record is a crash
 window, and it is visible. This holds for all operation types, mutating or not
 (see `05-operations.md`, M5).
+
+`Indeterminate` frequency is the intended **operational signal**, and the
+record is designed to be consumed on that basis, not only replayed: a burst
+of `Indeterminate` means the supervisor is under resource pressure or is being
+fed pathological tokens, while a burst of `Denied` means a misconfigured
+agent. The two streaks in the record are what make a burst legible, and
+neither alone is sufficient: a machine-pressure burst is one indeterminate
+on each of many sessions, so **every per-session count reads 1** while the
+supervisor-wide count climbs; a single pathological client climbs the
+per-session count on one session while the supervisor-wide count stays low.
+Together they answer "one client or the whole machine?". Both are advisory:
+nothing in v0 acts on them, but log tooling built later should treat these
+records as load-bearing, not incidental.
 
 `peer.verified` must be `true` for any `Authorized` record. A verifier that
 finds otherwise reports a critical finding.

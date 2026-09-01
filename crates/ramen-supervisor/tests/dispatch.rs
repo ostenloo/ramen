@@ -530,3 +530,74 @@ fn audit_failure_is_process_fatal_not_per_request_refusal() {
         "no Authorized record may exist for the un-auditable request"
     );
 }
+
+// ---------------------------------------------------------------------------
+// §9 `Indeterminate`: a failure of the *evaluation itself* (engine limit)
+// is not a denial. `RAMEN_TEST_FORCE_EVAL_TIMEOUT=1` sets the datalog
+// engine's time limit to zero, so every evaluation fails with
+// `RunLimit(Timeout)` deterministically — the same failure class that bit
+// us under load. The operation is refused, but the client must see
+// `Error/EvaluationIncomplete` (never `Denied`), and the audit record must
+// be `Indeterminate` with the limits in force, not `Denied`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn evaluation_failure_is_indeterminate_not_denied() {
+    let fx = common::Fixture::new();
+    let requirement = format!("identifier \"{}\"", common::test_binary_identifier());
+    let body = fx.parts.body(&requirement);
+    let mut sup = common::Supervisor::start_with_body_env(
+        &fx,
+        &body,
+        &[("RAMEN_TEST_FORCE_EVAL_TIMEOUT", "1")],
+    );
+
+    let token = sup.token("agent:indet", &["Whoami"]);
+    let mut client = common::Client::connect(&sup.socket);
+    client.hello(&token);
+    let (id, resp) = client.request(WHOAMI);
+
+    // 1. Wire: an `Error`, with its own code — never `Denied`.
+    let Response::Error { id: rid, error, .. } = &resp else {
+        panic!("expected Error, got {resp:?}");
+    };
+    assert_eq!(*rid, id);
+    assert_eq!(error.code, ErrorCode::EvaluationIncomplete);
+
+    // 2. Audit: an `Indeterminate` record for the request, carrying the
+    //    limits in force — and no `Denied`.
+    let evs = events(&sup);
+    let ev = evs
+        .iter()
+        .find(|e| e.kind == RecordKind::Indeterminate && e.request_id == Some(id))
+        .cloned()
+        .expect("an Indeterminate audit record for the request");
+    assert_eq!(ev.identity.as_deref(), Some("agent:indet"));
+    let limits = ev.detail.get("limits").and_then(|l| l.as_object());
+    assert!(
+        limits.is_some_and(|l| l.get("max_time_ms").and_then(|v| v.as_u64()) == Some(0)),
+        "the limits the evaluation ran under must be recorded (the test hook\nforced a zero time limit): {:?}",
+        ev.detail
+    );
+    // Both streaks: per-session and supervisor-wide. First indeterminate
+    // on this session and in this process, so both read 1.
+    assert_eq!(
+        ev.detail.get("consecutive").and_then(|v| v.as_u64()),
+        Some(1),
+        "per-session streak on the first indeterminate: {:?}",
+        ev.detail
+    );
+    assert_eq!(
+        ev.detail.get("system_consecutive").and_then(|v| v.as_u64()),
+        Some(1),
+        "supervisor-wide streak on the first indeterminate: {:?}",
+        ev.detail
+    );
+    assert!(
+        !evs.iter().any(|e| e.kind == RecordKind::Denied),
+        "an evaluation failure must never be audited as Denied"
+    );
+
+    drop(client);
+    sup.terminate_and_wait();
+}

@@ -36,3 +36,100 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test -p ramen-proto -p ramen-sdk --test spec_examples
+
+  # The `test-hooks` feature (off by default) gates every `RAMEN_TEST_*`
+  # environment hook — audit-failure injection, forced evaluation timeout,
+  # the FileWrite pause/barrier hooks. A hook that reaches a production
+  # binary is a live control point: `RAMEN_TEST_AUDIT_FAIL_AFTER` in a
+  # privileged process whose invariant 4 is "a decision that cannot be
+  # audited is refused" lets anyone who can influence the process
+  # environment disable the audit. So: the release binary is built without
+  # the feature, and this job fails if any `RAMEN_TEST_` string survives in
+  # it. That converts "we don't enable that in production" from a
+  # convention into a build property. (`00-overview.md`, Dependencies.)
+  #
+  # Scope, stated plainly: the strings scan is a *tripwire on the cfg
+  # gating*, not a general test-hook detector. It catches hooks that key
+  # off environment-variable string literals — the class this codebase
+  # uses — because those literals are what `#[cfg]` removes from the
+  # binary. A hook keyed on a config field, a file's presence, or an argv
+  # flag would not be caught by this scan; the property that stops it is
+  # the `cfg` gating itself (and the review of whatever feature gates it).
+  # If a new test hook is added, it must be (a) behind `test-hooks` and
+  # (b) named `RAMEN_TEST_*` so this scan sees it. A scan that reads as
+  # broader coverage than it has would let a future hook slip through
+  # unpinned.
+  test-hooks-absent:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build the release binary without test-hooks
+        run: cargo build --release -p ramen-supervisor
+      - name: no RAMEN_TEST_ hook may survive in the release binary
+        run: |
+          set -uo pipefail
+          if strings target/release/ramen-supervisor | grep -q 'RAMEN_TEST_'; then
+            echo "FAIL: RAMEN_TEST_ hooks found in the release binary"            echo "(the test-hooks feature must not be enabled in release builds)"
+            strings target/release/ramen-supervisor | grep 'RAMEN_TEST_'
+            exit 1
+          fi
+          echo "OK: no RAMEN_TEST_ hooks in the release binary"
+
+  # 00-overview.md "The spec moves with the code". Fails when the wire-format
+  # source (ramen-proto/src) or the authorization semantics (ramen-guard/src)
+  # change without a corresponding spec/ change in the same commit, unless a
+  # commit message in the range declares an explicit exemption:
+  # `spec: n/a — <reason>`. The exemption lives in the commit message, not the
+  # PR body: commit messages are immutable once pushed and present on push
+  # events too, while a PR body can be edited after the fact and does not
+  # exist for pushes.
+  #
+  # The coverage boundary is deliberate: these two crates are the ones whose
+  # source *is* the spec (01-protocol and 04-guard). The other crates change
+  # more often than their spec surface does, and a hard rule there would be
+  # noise. Known partial coverage, stated in 00-overview.md; extend this job
+  # in the same commit as any new spec-normative crate.
+  #
+  # Pure git plumbing — no macOS needed, unlike the rest of this workflow.
+  spec-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: spec/ moves with ramen-proto and ramen-guard
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ -n "$BASE_REF" ]; then
+            RANGE="origin/$BASE_REF...HEAD"
+          elif [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            RANGE="$BEFORE..HEAD"
+          else
+            # First push of a new branch: compare against the default branch.
+            # If it cannot be resolved, fail loudly — a silent pass here would
+            # make this job a no-op exactly when the branch is new.
+            if ! git rev-parse --verify --quiet origin/HEAD >/dev/null; then
+              echo "ERROR: cannot resolve comparison base (origin/HEAD unset)"
+              exit 1
+            fi
+            RANGE="origin/HEAD...HEAD"
+          fi
+          changed=$(git diff --name-only "$RANGE")
+          if printf '%s\n' "$changed" | grep -q '^crates/ramen-proto/src/\|^crates/ramen-guard/src/'; then
+            if printf '%s\n' "$changed" | grep -q '^spec/'; then
+              echo "OK: spec/ changed alongside ramen-proto/ramen-guard"
+            elif git log --format=%B "$RANGE" | grep -q 'spec: n/a'; then
+              echo "OK: explicit 'spec: n/a' exemption declared in a commit message"
+            else
+              echo "FAIL: crates/ramen-proto/src/ or crates/ramen-guard/src/ changed"
+              echo "without a change under spec/. Update the spec in the same"
+              echo "commit, or declare 'spec: n/a — <reason>' in a commit message."
+              exit 1
+            fi
+          else
+            echo "OK: no ramen-proto/ramen-guard source changes in this range"
+          fi

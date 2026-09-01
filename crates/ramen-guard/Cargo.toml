@@ -3,6 +3,14 @@ name = "ramen-guard"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Test surface: `Guard::with_eval_limits` — a constructor that can make
+# every authorization `Indeterminate` (zero evaluation limits). Off by
+# default and out of the shipped API; the supervisor's dev-dependency
+# enables it for e2e tests, and the CI binary-scan job pins its absence
+# from release builds (`00-overview.md`).
+test-hooks = []
+
 [dependencies]
 # Exact pin (00-overview.md Dependencies; M0 spike). The guard is the only
 # other crate that touches biscuit directly, besides the supervisor's
@@ -12,7 +20,16 @@ biscuit-auth = { workspace = true }
 # Constraints. No I/O types.
 ramen-proto = { path = "../ramen-proto" }
 thiserror = { workspace = true }
+# Revocation id derivation (07-delegation.md §5): hex(SHA-256(…)) over the
+# canonical block content and the signer's public key.
+sha2 = { workspace = true }
+base64 = { workspace = true }
 
 [dev-dependencies]
 # Test-only: temp dirs for the FileRootKey load tests.
 tempfile = { workspace = true }
+# Test-only (revocation-id re-encoding tests): re-serialize the token's proto
+# with a swapped signature field. Pinned to the exact prost biscuit-auth
+# uses internally, so schema::Biscuit implements the same Message trait —
+# no new crate in the graph, just a test-target edge.
+prost = "=0.10.4"

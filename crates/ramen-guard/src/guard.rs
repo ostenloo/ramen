@@ -35,10 +35,10 @@
 //!    catch-all. The probes never produce an Allow; they name the denial.
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use biscuit_auth::builder::{date as date_term, fact as datalog_fact, AuthorizerBuilder};
-use biscuit_auth::{error, Authorizer, Biscuit, UnverifiedBiscuit};
+use biscuit_auth::{error, format::SerializedBiscuit, Authorizer, AuthorizerLimits, Biscuit, UnverifiedBiscuit};
 use ramen_proto::messages::{
     CapabilitySummary, Constraints, DenialCode, Operation, Reversibility,
 };
@@ -70,6 +70,33 @@ pub enum Decision {
         code: DenialCode,
         reason: String,
     },
+    /// The guard could not reach a decision: the evaluation itself failed
+    /// (engine limit, engine error, or an unexpected engine error the guard
+    /// does not recognize as a token fault). The operation is refused —
+    /// fail closed, exactly like `Deny` — but the failure is **not
+    /// classified**: the denial-classification probes are differentials
+    /// against a primary result, and a failed primary provides none. On the
+    /// wire this maps to `Error/EvaluationIncomplete`, never `Denied`; in
+    /// the audit log it is its own record kind, because a burst of
+    /// indeterminates is resource pressure or a pathological-token attack,
+    /// while a burst of denials is a misconfigured agent (`04-guard.md`
+    /// §9).
+    ///
+    /// `limits` is the evaluation limits **in force for this evaluation**,
+    /// captured by the guard at decision time — not a configuration getter,
+    /// so the audit record shows the parameters the evaluation actually ran
+    /// under.
+    ///
+    /// `Indeterminate` is also deliberately the outcome for engine errors
+    /// the guard cannot classify as either a token fault or a completed
+    /// denial: a `panic!` in the guard would be a supervisor crash triggered
+    /// by an attacker-supplied token — every in-flight session drops — the
+    /// worst outcome available. Failing closed is safer *and* louder: the
+    /// record names the unexpected variant.
+    Indeterminate {
+        reason: String,
+        limits: AuthorizerLimits,
+    },
 }
 
 /// The guard. Stateless across requests: the only per-request state is the
@@ -78,6 +105,37 @@ pub struct Guard {
     root: Box<dyn RootKey>,
     control_plane: ControlPlanePaths,
     fs: Box<dyn Fs>,
+    eval_limits: AuthorizerLimits,
+}
+
+/// Evaluation limits for every authorizer the guard builds.
+///
+/// biscuit-auth's datalog engine defaults to a **1 ms wall-clock limit**
+/// (`RunLimits::default`). Under load, evaluating a perfectly valid token
+/// can exceed it, in which case `authorize()`/`query()` return
+/// `Err(RunLimit(Timeout))` and the guard misclassifies a valid token as a
+/// denial — biscuit's own test suite overrides the limit for exactly this
+/// reason. The token depth cap (10 blocks) already bounds token complexity,
+/// so the limits are generous: evaluation that still exceeds them is
+/// degenerate, and denying it is the right verdict. Pinned by
+/// `authorizer_limits_exceed_biscuit_one_millisecond_default`.
+fn default_eval_limits() -> AuthorizerLimits {
+    AuthorizerLimits {
+        max_facts: 10_000,
+        max_iterations: 10_000,
+        max_time: Duration::from_secs(1),
+    }
+}
+
+/// An advisory authorizer (no guard facts, no policy): the token's own
+/// evaluation only, with the guard's limits. A timeout here degrades to an
+/// empty result, never a denial — but a 1 ms limit would degrade far too
+/// often under load, so the limits are set here as well.
+fn advisory_authorizer(biscuit: &Biscuit, limits: AuthorizerLimits) -> Option<Authorizer> {
+    AuthorizerBuilder::new()
+        .set_limits(limits)
+        .build(biscuit)
+        .ok()
 }
 
 impl Guard {
@@ -90,6 +148,33 @@ impl Guard {
             root,
             control_plane,
             fs,
+            eval_limits: default_eval_limits(),
+        }
+    }
+
+    /// Same as [`Guard::new`] with explicit datalog-engine evaluation limits
+    /// (`04-guard.md` §4). The default is [`default_eval_limits`].
+    ///
+    /// Test/operations surface only: a limit of zero makes every
+    /// authorization `Indeterminate`. It is behind `test-hooks` so the
+    /// shipped API cannot construct a guard that never reaches a decision.
+    /// There is deliberately **no public getter** for the limits: the
+    /// `Indeterminate` decision carries them (captured at decision time),
+    /// and the supervisor records them from the decision — a getter
+    /// reports configuration, the decision reports what the evaluation
+    /// actually ran under.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn with_eval_limits(
+        root: Box<dyn RootKey>,
+        control_plane: ControlPlanePaths,
+        fs: Box<dyn Fs>,
+        eval_limits: AuthorizerLimits,
+    ) -> Self {
+        Self {
+            root,
+            control_plane,
+            fs,
+            eval_limits,
         }
     }
 
@@ -137,7 +222,65 @@ impl Guard {
                 };
             }
         };
-        let allowed = matches!(az.authorize(), Ok(0));
+        let allowed = match az.authorize() {
+            Ok(0) => true,
+            // A policy other than index 0 matched (the `deny if true`
+            // catch-all): a genuine denial — classify it below.
+            Ok(_) => false,
+            // A check failed (expiry, an attenuation condition): the
+            // evaluation **completed** and the outcome is deterministic —
+            // a denial, classified below. A probe differential against a
+            // completed evaluation is meaningful, which is exactly how
+            // expiry is distinguished from other check failures.
+            Err(error::Token::FailedLogic(_)) => false,
+            // Token-derived engine failures: the engine surfaced a fault
+            // in the token itself — format, encoding, datalog language,
+            // term conversion, or an expression in the token's own
+            // checks/policies that cannot be evaluated. These are
+            // deterministic (the same token always fails the same way):
+            // the *token* failed, not the machine. Rejected; never
+            // `Indeterminate`, which is reserved for the machine (§9).
+            Err(e @ (error::Token::Format(_)
+            | error::Token::Base64(_)
+            | error::Token::Language(_)
+            | error::Token::ConversionError(_)
+            | error::Token::Execution(_))) => {
+                return Decision::Deny {
+                    code: DenialCode::TokenRejected,
+                    reason: format!("token rejected: {e}"),
+                }
+            }
+            // The evaluation itself failed to complete: an engine limit
+            // (wall-clock under load) or an engine-internal fault. No
+            // decision was reached, and the classification probes —
+            // differentials against a primary result — are meaningless
+            // without one. Fail closed with its own outcome, never a
+            // classified code (`04-guard.md` §9). The limits are the guard's
+            // own, captured at decision time — the parameters this
+            // evaluation actually ran under.
+            Err(e @ (error::Token::RunLimit(_) | error::Token::InternalError)) => {
+                return Decision::Indeterminate {
+                    reason: format!("authorization evaluation failed: {e}"),
+                    limits: self.eval_limits.clone(),
+                }
+            }
+            // Token construction-side errors: a verifier never appends or
+            // seals, so these are unreachable through `authorize`. But the
+            // whole point of the exhaustive match is not trusting what the
+            // library returns to stay true — and a panic here would be a
+            // supervisor crash triggered by an attacker-supplied token,
+            // dropping every in-flight session, the worst outcome available.
+            // Fail closed, name the unexpected variant loudly in the record,
+            // keep the process up (`04-guard.md` §9).
+            Err(e @ (error::Token::AppendOnSealed | error::Token::AlreadySealed)) => {
+                return Decision::Indeterminate {
+                    reason: format!(
+                        "unexpected engine error (token builder state, unreachable through authorize): {e:?}"
+                    ),
+                    limits: self.eval_limits.clone(),
+                }
+            }
+        };
 
         // 4. Prefix (FileWrite, only after the authorizer allowed): within
         //    at least one allowed_prefix("FileWrite", ...), component-wise.
@@ -172,7 +315,7 @@ impl Guard {
         let Ok(biscuit) = self.verify_against_root(token_b64) else {
             return Vec::new();
         };
-        let Ok(mut q) = biscuit.authorizer() else {
+        let Some(mut q) = advisory_authorizer(&biscuit, self.eval_limits.clone()) else {
             return Vec::new();
         };
         let Ok(caps) = q.query::<_, (String,), error::Token>("res($op) <- capability($op)")
@@ -221,9 +364,7 @@ impl Guard {
         let Ok(biscuit) = self.verify_against_root(token_b64) else {
             return None;
         };
-        let Ok(mut q) = biscuit.authorizer() else {
-            return None;
-        };
+        let mut q = advisory_authorizer(&biscuit, self.eval_limits.clone())?;
         let Ok(res) = q.query::<_, (SystemTime,), error::Token>("res($d) <- expires_at($d)")
         else {
             return None;
@@ -280,6 +421,7 @@ impl Guard {
             .map_err(|e| e.to_string())?
             .fact(datalog_fact("date", &[date_term(&req.now)]))
             .map_err(|e| e.to_string())?
+            .set_limits(self.eval_limits.clone())
             .build(biscuit)
             .map_err(|e| e.to_string())
     }
@@ -298,7 +440,7 @@ impl Guard {
             .code(&code)
             .ok()
             .and_then(|b| b.fact(datalog_fact("date", &[date_term(&now)])).ok())
-            .and_then(|b| b.build(biscuit).ok())
+            .and_then(|b| b.set_limits(self.eval_limits.clone()).build(biscuit).ok())
     }
 
     // ── Denial classification ──────────────────────────────────────────────
@@ -362,7 +504,7 @@ impl Guard {
     }
 
     fn allowed_prefixes(&self, biscuit: &Biscuit, op_name: &str) -> Vec<String> {
-        let Ok(mut q) = biscuit.authorizer() else {
+        let Some(mut q) = advisory_authorizer(biscuit, self.eval_limits.clone()) else {
             return Vec::new();
         };
         let rule = format!("res($p) <- allowed_prefix(\"{op_name}\", $p)");
@@ -379,6 +521,90 @@ impl Guard {
     /// supervisor's tests) need to embed paths in `allowed_prefix` facts.
     pub fn datalog_string(s: &str) -> String {
         format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+
+    /// Domain separation for the revocation-id hash — the same convention as
+    /// `ramen_audit::chain::GENESIS_DOMAIN`. The id must never be
+    /// confusable with a value from another SHA-256 namespace in this tree
+    /// (audit chain hashes, file-content hashes); the tag makes that
+    /// structurally impossible instead of relying on input shape.
+    pub const REVOCATION_ID_DOMAIN: &[u8; 19] = b"ramen.revocation.v1";
+
+    /// The revocation id of block `i`: `hex(SHA-256(DOMAIN || L(content) ||
+    /// content || L(key) || key))`, where `DOMAIN` is the constant
+    /// `ramen.revocation.v1` (§5), `content` is the block's raw datalog bytes
+    /// as stored in the token's signed envelope (the protobuf `block` field)
+    /// and `key` is the public key that signed it — the root key for block 0,
+    /// the previous block's `next_key` for block `i > 0` (`07-delegation.md`
+    /// §5).
+    ///
+    /// Derived from content + signer, **not** from the signature bytes:
+    /// ECDSA P-256 signatures are DER-encoded, and `(r, s)` / `(r, n−s)` are
+    /// both valid encodings of the same signature (the verifier does not
+    /// enforce low-s under the pinned biscuit-auth — see
+    /// `p256_high_s_reencoding_keeps_the_id`). A signature-derived id would
+    /// therefore change under re-encoding and revocations would stop matching.
+    /// The content + signer key is canonical under re-encoding, and the fixed
+    /// 64-hex-char length closes the variable-length id leak (block 0's
+    /// P-256 DER signature was 69–72 bytes; Ed25519 blocks 64).
+    ///
+    /// The length prefixes (`u32be`) make the concatenation split-unambiguous
+    /// (`content1||key1 == content2||key2` is impossible across splits).
+    ///
+    /// The single source for revocation ids in the tree — the guard's set
+    /// membership, `ramenctl token inspect`, the revocation file, and the
+    /// audit `chain` all call this, so the four always agree.
+    ///
+    /// The id is only computable for tokens that parse and verify against
+    /// `root` (the parse re-verifies; on the guard's hot path the token is
+    /// already verified, and the cost is one extra signature check).
+    /// Returns `None` when the token does not verify or the index is out of
+    /// range — both mean "no id for this token".
+    pub fn revocation_id(
+        token_b64: &str,
+        root: &biscuit_auth::PublicKey,
+        i: usize,
+    ) -> Option<String> {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+
+        let bytes = base64::engine::general_purpose::URL_SAFE
+            .decode(token_b64)
+            .ok()?;
+        let deser = SerializedBiscuit::from_slice(&bytes, |_k| Ok(*root)).ok()?;
+        let proto = deser.to_proto();
+
+        let root_key = root.to_bytes();
+        // `proto.blocks` excludes the authority: token block i is at
+        // `proto.blocks[i-1]` for i ≥ 1.
+        let (content, key): (&[u8], &[u8]) = match i {
+            // Block 0: signed by the root — key-bound to the identity that
+            // issued the grant (re-issued tokens with the same content under
+            // the same root share the id; a different root does not).
+            0 => (&proto.authority.block, &root_key),
+            // Block i ≥ 1: signed with block i−1's `next_key` (key-inheritance).
+            _ => {
+                let cur = proto.blocks.get(i - 1)?;
+                let prev_key: &biscuit_auth::format::schema::PublicKey = if i == 1 {
+                    &proto.authority.next_key
+                } else {
+                    &proto.blocks[i - 2].next_key
+                };
+                (&cur.block, &prev_key.key)
+            }
+        };
+
+        let mut h = Sha256::new();
+        h.update(Self::REVOCATION_ID_DOMAIN);
+        h.update((content.len() as u32).to_be_bytes());
+        h.update(content);
+        h.update((key.len() as u32).to_be_bytes());
+        h.update(key);
+        Some(h
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect())
     }
 
     fn reversibility_name(r: Reversibility) -> &'static str {
@@ -1144,6 +1370,83 @@ mod tests {
     }
 
     #[test]
+    fn authorizer_limits_exceed_biscuit_one_millisecond_default() {
+        // biscuit-auth's datalog engine defaults to a 1ms wall-clock limit
+        // (`RunLimits::default`); under load, a perfectly valid token
+        // evaluation can exceed it, `authorize()` returns
+        // `Err(RunLimit(Timeout))`, and the guard misclassifies a valid
+        // token as a denial. biscuit's own test suite overrides the limit
+        // for exactly this reason. The guard must therefore build its
+        // authorizers with raised limits — this test pins that: a
+        // regression that drops `set_limits` fails here.
+        let (guard, root) = test_guard(Arc::new(FakeFs::new()));
+        let token = mint(&root, FULL_CODE);
+        let biscuit = guard.verify_against_root(&token).unwrap();
+        let az = guard.build_authorizer(
+            &biscuit,
+            req(&token, &whoami()),
+            None,
+        )
+        .unwrap();
+        assert!(
+            az.limits().max_time > Duration::from_millis(1),
+            "authorizer time limit is the biscuit default — valid tokens will be mis-denied under load"
+        );
+    }
+
+    #[test]
+    fn runlimit_error_is_indeterminate_never_deny() {
+        // The regression that actually bit us: the datalog engine can fail
+        // the *evaluation itself* (a wall-clock limit under load). That
+        // failure used to be turned into a `Deny` — and, worse, the
+        // far-past probe then ran against a primary that had no result and
+        // classified the failure as `TokenExpired`. Force the failure
+        // deterministically: `max_time = 0` makes `Instant::now() >= start`
+        // true after the first iteration, so every evaluation fails with
+        // `RunLimit(Timeout)` regardless of load.
+        //
+        // The outcome must be `Indeterminate` — fail closed, unclassified —
+        // never `Deny`, and specifically never `TokenExpired`.
+        let root = TestRoot::new();
+        let guard = Guard::with_eval_limits(
+            Box::new(root.clone()),
+            control_plane(),
+            Box::new(ArcFs(Arc::new(FakeFs::new()))),
+            AuthorizerLimits {
+                max_time: Duration::from_secs(0),
+                ..default_eval_limits()
+            },
+        );
+        let token = mint(&root, FULL_CODE);
+        let d = guard.authorize(req(&token, &whoami()));
+        match &d {
+            Decision::Indeterminate { reason, limits } => {
+                assert!(
+                    reason.contains("evaluation failed"),
+                    "reason should say what failed: {reason}"
+                );
+                // The decision carries the limits the evaluation *actually
+                // ran under* — not a configuration read. The fault
+                // injection used a zero time limit; the record must show
+                // exactly that.
+                assert_eq!(limits.max_time, Duration::from_secs(0));
+            }
+            other => panic!(
+                "engine limit error must be Indeterminate, got {other:?}"
+            ),
+        }
+        // The specific wrong code that the old code produced for this
+        // failure, called out explicitly:
+        assert!(!matches!(
+            d,
+            Decision::Deny {
+                code: DenialCode::TokenExpired,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn attenuation_check_clause_is_enforced_by_guard() {
         // The attenuator appends a check clause narrowing the token to
         // FileWrite only. The token still verifies against the root, and the
@@ -1234,6 +1537,323 @@ mod tests {
         );
         // ...while the root-granted capability still works.
         assert_eq!(guard.authorize(req(&token, &whoami())), Decision::Allow);
+    }
+
+    // ── Revocation ids (`07-delegation.md` §5) ──────────────────────────────
+
+    /// P-256 field order `n` (the ECDSA scalar modulus).
+    const P256_N: [u8; 32] = [
+        0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84, 0xF3, 0xB9, 0xCA, 0xC2,
+        0xFC, 0x63, 0x25, 0x51,
+    ];
+
+    /// Ed25519 group order `L` = 2^252 + 27742317777372353535851937790883648493.
+    const ED25519_L: [u8; 32] = [
+        0x00, 0x00, 0x00, 0x10,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x14, 0xDE, 0xF9, 0xDE,
+        0xA2, 0xF7, 0x9C, 0xD6,
+        0x58, 0x12, 0x63, 0x1A,
+        0x5C, 0xF5, 0xD3, 0xED,
+    ];
+
+    /// Parse a P-256 DER signature `SEQUENCE { INTEGER r, INTEGER s }` into
+    /// fixed 32-byte big-endian scalars (leading zeros ignored).
+    fn der_parse_rs(sig: &[u8]) -> ([u8; 32], [u8; 32]) {
+        assert_eq!(sig[0], 0x30, "P-256 signature must be DER-encoded");
+        let mut i = 2; // SEQUENCE header (short form: < 128 bytes)
+        let mut r = [0u8; 32];
+        let mut s = [0u8; 32];
+        for slot in [&mut r, &mut s] {
+            assert_eq!(sig[i], 0x02, "expected INTEGER");
+            let len = sig[i + 1] as usize;
+            i += 2;
+            let raw = &sig[i..i + len];
+            // DER pads with 0x00 when the high bit is set — strip leading
+            // zeros to get the ≤32-byte scalar.
+            let first = raw.iter().position(|&b| b != 0).unwrap_or(raw.len() - 1);
+            let bytes = &raw[first..];
+            assert!((1..=32).contains(&bytes.len()), "INTEGER too long");
+            slot[32 - bytes.len()..].copy_from_slice(bytes);
+            i += len;
+        }
+        assert_eq!(i, sig.len(), "trailing bytes after s");
+        (r, s)
+    }
+
+    /// Re-encode `(r, s)` as DER, normalizing (strip leading zeros, pad with
+    /// 0x00 when the high bit is set).
+    fn der_encode_rs(r: &[u8; 32], s: &[u8; 32]) -> Vec<u8> {
+        fn enc(v: &[u8; 32]) -> Vec<u8> {
+            let first = v.iter().position(|&b| b != 0).unwrap_or(31);
+            let body = &v[first..];
+            let mut out = vec![0x02];
+            let padded = body[0] & 0x80 != 0;
+            out.push((body.len() + padded as usize) as u8);
+            if padded {
+                out.push(0);
+            }
+            out.extend_from_slice(body);
+            out
+        }
+        let (r_e, s_e) = (enc(r), enc(s));
+        let mut out = vec![0x30, (r_e.len() + s_e.len()) as u8];
+        out.extend_from_slice(&r_e);
+        out.extend_from_slice(&s_e);
+        out
+    }
+
+    /// `n − s` for the P-256 field order (valid since `s < n`).
+    fn p256_high_s(s: &[u8; 32]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let mut borrow = 0u8;
+        for i in (0..32).rev() {
+            let (a, b1) = P256_N[i].overflowing_sub(s[i]);
+            let (b, b2) = a.overflowing_sub(borrow);
+            out[i] = b;
+            borrow = b1 as u8 + b2 as u8;
+        }
+        assert_eq!(borrow, 0, "s >= n — not a valid P-256 signature");
+        out
+    }
+
+    /// `r || (s + L)` for an Ed25519 64-byte signature (`s < L`, so no wrap).
+    fn ed25519_s_plus_l(sig: &[u8; 64]) -> [u8; 64] {
+        let mut s = [0u8; 32];
+        s.copy_from_slice(&sig[32..]);
+        let mut out_s = [0u8; 32];
+        let mut carry = 0u8;
+        for i in (0..32).rev() {
+            let (a, c1) = s[i].overflowing_add(ED25519_L[i]);
+            let (b, c2) = a.overflowing_add(carry);
+            out_s[i] = b;
+            carry = c1 as u8 + c2 as u8;
+        }
+        assert_eq!(carry, 0, "s + L overflowed 2^256");
+        let mut out = *sig;
+        out[32..].copy_from_slice(&out_s);
+        out
+    }
+
+    /// Rebuild the raw token bytes with block `i`'s signature replaced. The
+    /// signature is verified over the block's `data` + `next_key` (+ the
+    /// previous signature bytes), never over the envelope, so swapping the
+    /// `signature` field and re-serializing is a valid re-encoding attempt.
+    fn retoken(bytes: &[u8], root: &PublicKey, i: usize, new_sig: &[u8]) -> Vec<u8> {
+        use prost::Message;
+        let provider = |_k: Option<u32>| Ok(*root);
+        let sb = SerializedBiscuit::from_slice(bytes, provider).expect("original verifies");
+        let mut proto = sb.to_proto();
+        let block = if i == 0 {
+            &mut proto.authority
+        } else {
+            &mut proto.blocks[i - 1]
+        };
+        block.signature = new_sig.to_vec();
+        let mut out = Vec::new();
+        proto
+            .encode(&mut out)
+            .expect("proto encode");
+        out
+    }
+
+    fn b64(bytes: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE.encode(bytes)
+    }
+
+    /// A two-block token: block 0 signed by the P-256 root, block 1 signed by
+    /// the token's own embedded delegable key (key-inheritance — the same
+    /// model ramen-mint uses).
+    fn two_block_token(root: &TestRoot) -> String {
+        let token = BiscuitBuilder::new()
+            .code(FULL_CODE)
+            .unwrap()
+            .build(&root.keypair())
+            .unwrap();
+        UnverifiedBiscuit::from_base64(token.to_base64().unwrap().as_bytes())
+            .unwrap()
+            .append(BlockBuilder::new().code("check if true").unwrap())
+            .unwrap()
+            .to_base64()
+            .unwrap()
+    }
+
+    #[test]
+    fn revocation_id_is_fixed_length_stable_and_key_bound() {
+        // 64 lowercase hex chars for every block — the fixed length closes
+        // the variable-length id leak (block 0's P-256 DER signature was
+        // 69–72 bytes; Ed25519 blocks 64).
+        let root = TestRoot::new();
+        let token = two_block_token(&root);
+        for i in 0..2 {
+            let id = Guard::revocation_id(&token, &root.pubk, i).unwrap();
+            assert_eq!(id.len(), 64, "block {i} id length");
+            assert!(id.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+            // Deterministic.
+            assert_eq!(id, Guard::revocation_id(&token, &root.pubk, i).unwrap());
+        }
+        // Distinct per block (content and key both differ).
+        assert_ne!(
+            Guard::revocation_id(&token, &root.pubk, 0).unwrap(),
+            Guard::revocation_id(&token, &root.pubk, 1).unwrap()
+        );
+
+        // Re-issue: same content, same root → same id (the id names the
+        // identity's grant, not the signing event).
+        let token2 = two_block_token(&root);
+        assert_ne!(token, token2, "fresh signatures differ");
+        assert_eq!(
+            Guard::revocation_id(&token, &root.pubk, 0).unwrap(),
+            Guard::revocation_id(&token2, &root.pubk, 0).unwrap()
+        );
+
+        // Key bound: same content under a different root → different id.
+        let other = TestRoot::new();
+        let token3 = two_block_token(&other);
+        assert_ne!(
+            Guard::revocation_id(&token, &root.pubk, 0).unwrap(),
+            Guard::revocation_id(&token3, &other.pubk, 0).unwrap()
+        );
+
+        // Out of range.
+        assert!(Guard::revocation_id(&token, &root.pubk, 2).is_none());
+        // Unverifiable token (wrong root) → no id.
+        assert!(Guard::revocation_id(&token, &other.pubk, 0).is_none());
+    }
+
+    #[test]
+    fn revocation_id_is_domain_separated() {
+        // The id must not be confusable with a value from another SHA-256
+        // namespace in this tree (audit chain hashes, file-content hashes).
+        // The domain tag makes that structural; this test pins it — a
+        // derivation change that drops the tag fails here.
+        let root = TestRoot::new();
+        let token = two_block_token(&root);
+        let id = Guard::revocation_id(&token, &root.pubk, 0).unwrap();
+
+        // Recompute block 0's id without the domain tag.
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+        let bytes = base64::engine::general_purpose::URL_SAFE
+            .decode(&token)
+            .unwrap();
+        let provider = |_k: Option<u32>| Ok(root.pubk);
+        let proto = SerializedBiscuit::from_slice(&bytes, provider)
+            .unwrap()
+            .to_proto();
+        let (content, key) = (&proto.authority.block, &root.pubk.to_bytes());
+        let mut h = Sha256::new();
+        h.update((content.len() as u32).to_be_bytes());
+        h.update(content);
+        h.update((key.len() as u32).to_be_bytes());
+        h.update(key);
+        let undomained = h
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        assert_ne!(id, undomained, "id must not collide with the undomained form");
+    }
+
+    #[test]
+    fn p256_high_s_reencoding_of_last_block_keeps_the_id() {
+        // The exploit: P-256 signatures are DER, and (r, n−s) verifies the
+        // same as (r, s) — the pinned biscuit-auth does not enforce low-s
+        // (`ecdsa`'s verify_prehashed inverts s, and negation flips only the
+        // y coordinate). Re-encoding the signature bytes of the LAST block
+        // (nothing seals it) therefore produces a still-valid token with a
+        // different signature — which is exactly why the id must not be
+        // derived from the signature.
+        let root = TestRoot::new();
+        let base = mint(&root, FULL_CODE); // one block, P-256 root
+        let bytes = base64_decode(&base);
+        let orig_sig = signature_of(&bytes, &root.pubk, 0);
+        let (r, s) = der_parse_rs(&orig_sig);
+        let high_s = p256_high_s(&s);
+        assert_ne!(high_s, s);
+
+        let retok = retoken(&bytes, &root.pubk, 0, &der_encode_rs(&r, &high_s));
+
+        // Premise pin: the re-encoded token still verifies.
+        let provider = |_k: Option<u32>| Ok(root.pubk);
+        let sb = SerializedBiscuit::from_slice(&retok, provider)
+            .expect("high-s re-encoding must still verify (the vulnerability)");
+        // ...and the signature bytes actually changed (so a signature-derived
+        // id WOULD have changed — the old derivation was broken).
+        assert_ne!(sb.authority.signature.to_bytes(), orig_sig);
+
+        // ...but the content+key id is unchanged.
+        assert_eq!(
+            Guard::revocation_id(&base, &root.pubk, 0).unwrap(),
+            Guard::revocation_id(&b64(&retok), &root.pubk, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn p256_high_s_reencoding_of_nonfinal_block_breaks_the_chain() {
+        // Block 1's signature covers block 0's signature bytes (PREVSIG in
+        // the v1 payload), so re-encoding a non-final block invalidates the
+        // chain: the whole token fails verification. Self-defense — the
+        // exploit is limited to the last block.
+        let root = TestRoot::new();
+        let token = two_block_token(&root);
+        let bytes = base64_decode(&token);
+        let sig0 = signature_of(&bytes, &root.pubk, 0);
+        let (r, s) = der_parse_rs(&sig0);
+        let retok = retoken(&bytes, &root.pubk, 0, &der_encode_rs(&r, &p256_high_s(&s)));
+
+        let provider = |_k: Option<u32>| Ok(root.pubk);
+        assert!(
+            SerializedBiscuit::from_slice(&retok, provider).is_err(),
+            "re-encoding block 0 must break the chain"
+        );
+    }
+
+    #[test]
+    fn ed25519_s_plus_l_reencoding_is_rejected() {
+        // Ed25519 has a re-encoding analog: s and s+L sign the same message.
+        // The pinned ed25519-dalek rejects s ≥ L (from_canonical_bytes; the
+        // legacy_compatibility feature is not enabled by biscuit). This test
+        // pins that strictness — if a library bump starts accepting s+L, the
+        // Ed25519 blocks become re-encodable and the last-block exploit
+        // reaches them too; the content+key id would still hold, but the
+        // chain's self-defense assumption changes.
+        let root = TestRoot::new();
+        let token = two_block_token(&root); // block 1 is Ed25519
+        let bytes = base64_decode(&token);
+        let sig1 = signature_of(&bytes, &root.pubk, 1);
+        assert_eq!(sig1.len(), 64, "Ed25519 signature byte length");
+        let mut sig64 = [0u8; 64];
+        sig64.copy_from_slice(&sig1);
+        let retok = retoken(&bytes, &root.pubk, 1, &ed25519_s_plus_l(&sig64));
+
+        let provider = |_k: Option<u32>| Ok(root.pubk);
+        assert!(
+            SerializedBiscuit::from_slice(&retok, provider).is_err(),
+            "s+L must be rejected (canonical s)"
+        );
+    }
+
+    fn base64_decode(b64: &str) -> Vec<u8> {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE
+            .decode(b64)
+            .expect("valid base64")
+    }
+
+    /// The raw signature bytes of block `i` in the token.
+    fn signature_of(bytes: &[u8], root: &PublicKey, i: usize) -> Vec<u8> {
+        let provider = |_k: Option<u32>| Ok(*root);
+        let sb = SerializedBiscuit::from_slice(bytes, provider).expect("verifies");
+        if i == 0 {
+            sb.authority.signature.to_bytes().to_vec()
+        } else {
+            sb.blocks[i - 1].signature.to_bytes().to_vec()
+        }
     }
 
     #[test]

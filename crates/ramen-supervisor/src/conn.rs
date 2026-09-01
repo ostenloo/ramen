@@ -19,7 +19,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -63,6 +63,13 @@ pub struct ConnCtx {
     /// (a watch receiver: late subscribers still see the change) and audits
     /// `SessionClosed` (if a session was opened).
     pub shutdown: watch::Receiver<bool>,
+    /// Supervisor-wide consecutive-`Indeterminate` count: incremented per
+    /// `Indeterminate` decision on *any* session, reset by the next
+    /// `Allow`/`Deny` anywhere. Per-session streaks alone miss the load
+    /// case — a machine-pressure burst is one indeterminate on each of
+    /// forty sessions, so every per-session counter reads 1 while this one
+    /// climbs. Both are advisory only; nothing acts on them (`02-audit.md`).
+    pub indeterminate_streak: AtomicU32,
     /// Supervisor-level bound on `FileWrite` targets: canonicalized
     /// `allowed_prefixes` from the config (`05-operations.md` M6). An empty
     /// list means no `FileWrite` can ever succeed (fail closed).
@@ -108,13 +115,17 @@ static AUDIT_APPENDS: AtomicU64 = AtomicU64::new(0);
 /// supervisor therefore never sends `Error/AuditUnavailable` — the client
 /// sees a closed connection instead (`01-protocol.md` §6).
 ///
-/// Test hook: `RAMEN_TEST_AUDIT_FAIL_AFTER=N` makes the Nth append
-/// (process-wide count) fail so tests can exercise this path.
+/// Test hook (`test-hooks` feature, off by default): `RAMEN_TEST_AUDIT_FAIL_AFTER=N`
+/// makes the Nth append (process-wide count) fail so tests can exercise this
+/// path. Never compiled into release builds.
 async fn audit_append(audit: &AuditLog, record: &NewRecord) -> u64 {
     let n = AUDIT_APPENDS.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(feature = "test-hooks")]
     let fail_at = std::env::var("RAMEN_TEST_AUDIT_FAIL_AFTER")
         .ok()
         .and_then(|v| v.parse::<u64>().ok());
+    #[cfg(not(feature = "test-hooks"))]
+    let fail_at = None;
     let res = if fail_at == Some(n) {
         tracing::error!("test hook: simulating audit writer failure on append {n}");
         Err(AuditError::Closed)
@@ -150,6 +161,12 @@ struct Connection {
     /// Every request id seen on this connection, in-flight or terminal
     /// (single-use semantics, `01-protocol.md` §7).
     seen: HashSet<RequestId>,
+    /// Consecutive `Indeterminate` decisions on this session: incremented
+    /// per `Indeterminate`, reset by the next `Allow` or `Deny`. Advisory
+    /// operational signal only — nothing acts on it yet. It is what
+    /// distinguishes "one pathological client" from "genuine load" in a
+    /// burst of `Indeterminate` records (`02-audit.md`).
+    indeterminate_streak: u32,
     /// Requests dispatched but not yet answered (writer-queued).
     in_flight: HashSet<RequestId>,
     /// Completed dispatches awaiting reaping from `in_flight`.
@@ -211,6 +228,7 @@ pub async fn serve(stream: UnixStream, peer: PeerIdentity, ctx: Arc<ConnCtx>) {
         identity: None,
         token: None,
         seen: HashSet::new(),
+        indeterminate_streak: 0,
         in_flight: HashSet::new(),
         pending: VecDeque::new(),
     };
@@ -453,6 +471,23 @@ impl Connection {
             }
         };
 
+        // Indeterminate streaks (`02-audit.md`): per-session (one
+        // pathological client) and supervisor-wide (system-wide load). A
+        // machine-pressure burst is one indeterminate on each of many
+        // sessions — every per-session counter reads 1 while the
+        // supervisor-wide one climbs. Advisory only — nothing acts on
+        // them yet.
+        if matches!(&decision, Decision::Indeterminate { .. }) {
+            self.indeterminate_streak = self.indeterminate_streak.saturating_add(1);
+            self.ctx.indeterminate_streak
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.indeterminate_streak = 0;
+            self.ctx.indeterminate_streak.store(0, Ordering::Relaxed);
+        }
+        let indeterminate_streak = self.indeterminate_streak;
+        let system_indeterminate_streak = self.ctx.indeterminate_streak.load(Ordering::Relaxed);
+
         let op_type = req.op.type_name().to_string();
         let reversibility = req.op.reversibility();
         let tx = self.tx.clone();
@@ -483,6 +518,42 @@ impl Connection {
                         req.id,
                         Denial { code, reason, audit_seq },
                     )
+                }
+                Decision::Indeterminate { reason, limits } => {
+                    // The evaluation did not complete (engine limit,
+                    // engine error). Fail closed — but *not* as a
+                    // denial: its own wire code and its own audit kind. The
+                    // limits come **from the decision itself** — captured
+                    // by the guard at decision time, i.e. the parameters
+                    // this evaluation actually ran under — never from a
+                    // configuration getter (`04-guard.md` §9). A burst of
+                    // these is resource pressure or a pathological-token
+                    // attack; a burst of `Denied` is a misconfigured agent.
+                    // The two must stay distinguishable, and the two
+                    // streaks below say whether a burst is one client or
+                    // system-wide (`02-audit.md`).
+                    let record = NewRecord {
+                        kind: RecordKind::Indeterminate,
+                        session,
+                        identity,
+                        peer,
+                        request_id: Some(req.id),
+                        op_type: Some(op_type),
+                        reversibility: Some(reversibility),
+                        detail: serde_json::json!({
+                            "reason": reason,
+                            "consecutive": indeterminate_streak,
+                            "system_consecutive": system_indeterminate_streak,
+                            "limits": {
+                                "max_time_ms": limits.max_time.as_millis(),
+                                "max_facts": limits.max_facts,
+                                "max_iterations": limits.max_iterations,
+                            },
+                        }),
+                        client: None,
+                    };
+                    let _ = audit_append(&ctx.audit, &record).await;
+                    Response::error(req.id, ErrorCode::EvaluationIncomplete, reason)
                 }
                 Decision::Allow => {
                     // The decision is Allow. Each operation's effect path
@@ -703,9 +774,11 @@ impl Connection {
         };
         audit_append(&effect.ctx.audit, &record).await;
 
-        // Test-only hook: pause after the `Authorized` record is durable but
-        // before the effect runs. The crash-window test (SIGKILL between
-        // authorization and write, `02-audit.md` §8) relies on this.
+        // Test-only hook (`test-hooks` feature, off by default): pause after
+        // the `Authorized` record is durable but before the effect runs. The
+        // crash-window test (SIGKILL between authorization and write,
+        // `02-audit.md` §8) relies on this.
+        #[cfg(feature = "test-hooks")]
         if let Some(v) = std::env::var_os("RAMEN_TEST_PAUSE_AFTER_AUTHORIZED") {
             // Test hook: pause (seconds) between the durable `Authorized`
             // record and the effect. Unparseable values default to 60s.
@@ -714,13 +787,15 @@ impl Connection {
             tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
         }
 
-        // Test-only hook: wait for a barrier file before running the effect.
+        // Test-only hook (`test-hooks` feature, off by default): wait for a
+        // barrier file before running the effect.
         // The pin race test uses this to *synchronize* the swap into the
         // pin→write window instead of racing a sleep duration: the effect
         // cannot begin until the test has performed its swap and created the
         // file, so the interleaving is guaranteed by construction. A
         // duration-based window here would let a loaded machine land the
         // swap after the write, and the test would pass vacuously.
+        #[cfg(feature = "test-hooks")]
         if let Some(p) = std::env::var_os("RAMEN_TEST_BARRIER_BEFORE_EFFECT") {
             let path = std::path::PathBuf::from(p);
             tracing::info!(

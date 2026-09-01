@@ -327,6 +327,7 @@ pub enum DenialCode {
     ReversibilityNotPermitted,
     ControlPlaneProtected,
     TokenExpired,
+    TokenRejected,
 }
 
 impl DenialCode {
@@ -339,6 +340,7 @@ impl DenialCode {
             DenialCode::ReversibilityNotPermitted => "ReversibilityNotPermitted",
             DenialCode::ControlPlaneProtected => "ControlPlaneProtected",
             DenialCode::TokenExpired => "TokenExpired",
+            DenialCode::TokenRejected => "TokenRejected",
         }
     }
 }
@@ -360,6 +362,7 @@ pub enum ErrorCode {
     NotImplemented,
     IdentityUnverifiable,
     AuditUnavailable,
+    EvaluationIncomplete,
     ExecutionFailed,
     Internal,
 }

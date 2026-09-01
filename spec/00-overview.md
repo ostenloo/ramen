@@ -117,11 +117,20 @@ ramen/
   docs/
 ```
 
-**The spec moves with the code.** `spec/01-protocol.md` and `ramen-proto` change
-in the same commit. Add a CI check that fails when files under
-`crates/ramen-proto/src/` change without a corresponding change under
-`spec/`. If they are allowed to drift, the spec stops being authoritative and
-becomes documentation, which is a different and much less useful artifact.
+**The spec moves with the code.** The `spec-drift` job in
+`.github/workflows/ci.yaml` fails when files under `crates/ramen-proto/src/`
+or `crates/ramen-guard/src/` change without a corresponding change under
+`spec/`, unless a commit message in the change range declares `spec: n/a —
+<reason>` (an explicit, recorded exemption — in the commit message rather than
+the PR body, because it is immutable once pushed and present on push events
+too). The coverage boundary is deliberate and stated: the
+check protects the wire format (`ramen-proto` ↔ `01`) and the authorization
+semantics (`ramen-guard` ↔ `04` — the `time`/`date` fact-name drift of Aug 2025
+lived exactly there); the other crates are not covered, and that is known
+partial coverage, not silent. When a new crate becomes spec-normative, extend
+the job in the same commit. If the spec is allowed to drift, it stops being
+authoritative and becomes documentation, which is a different and much less
+useful artifact.
 
 ## Toolchain
 
@@ -153,7 +162,23 @@ Prefer a small, auditable set. This process is privileged.
   Keep P-256 and bind the token to the Secure Enclave key with an outer
   signature outside Biscuit. That decouples Biscuit's signing algorithm from
   key custody, which is where the coupling shouldn't have been anyway.
+  **The default `RunLimits` are part of the pinned behavior.** The datalog
+  engine defaults to a 1 ms wall-clock evaluation limit; the guard raises
+  them and maps an incomplete evaluation to `Indeterminate` rather than a
+  denial (`04-guard.md` §4, §9), but a bump that changes the defaults
+  (lower or higher) changes the load at which tokens can fail — and the
+  failure mode is a burst of `Indeterminate`, which is the signature of a
+  limit problem, so the tests that pin the limits and the indeterminate path
+  must be re-run on any bump.
 - `sha2` — audit chain hashing.
+- `prost` — **test-only** dev-dependency of `ramen-guard`, pinned to `=0.10.4`.
+  The revocation re-encoding tests (`07-delegation.md` §5) must re-serialize a
+  token with a swapped signature field, and the only public route to that is
+  biscuit-auth's generated proto schema; the pin must match the prost version
+  biscuit-auth builds against. A biscuit-auth bump that moves its prost
+  version breaks the *test* build — the fix is to update the pin, **not to
+  delete the tests**: the suite reaches into biscuit-auth's wire encoding
+  deliberately, that is the point of the re-encoding pins.
 - `tokio` (`net`, `rt-multi-thread`, `io-util`, `sync`, `macros` features only)
   — async runtime. Do not enable the full feature set.
 - `thiserror` — error types.
@@ -167,6 +192,21 @@ Prefer a small, auditable set. This process is privileged.
 Do not add a dependency to `ramen-proto` beyond `serde` and the id crate.
 `ramen-audit` additionally takes `tokio` with the `sync` feature only (mpsc /
 oneshot for the group-commit writer); no runtime features in that crate.
+
+**Test hooks are a build property, not a convention.** Every `RAMEN_TEST_*`
+environment hook in the supervisor (audit-failure injection, forced
+evaluation timeout, the FileWrite pause/barrier synchronization hooks) and
+every test-only guard constructor (`Guard::with_eval_limits`, which can make
+every authorization `Indeterminate`) is behind the `test-hooks` cargo
+feature, off by default. The test build enables it (a self dev-dependency);
+a release build has the hooks neither compiled in nor referenced, and a CI
+job builds the release supervisor and **fails if any `RAMEN_TEST_` string
+survives in the binary**. This matters because the hooks are live control
+points: `RAMEN_TEST_AUDIT_FAIL_AFTER` in a privileged process whose invariant
+4 is "a decision that cannot be audited is refused" would let anyone who can
+influence the process environment disable the audit. A hook that only
+exists in test builds cannot be switched on in production, so the risk is
+removed rather than policed.
 
 ## Build order
 

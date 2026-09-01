@@ -34,6 +34,15 @@ sha2 = { workspace = true }
 security-framework = { workspace = true }
 core-foundation = { workspace = true }
 
+[features]
+# Test hooks: the `RAMEN_TEST_*` environment hooks (audit-failure injection,
+# forced evaluation timeout, the FileWrite pause/barrier synchronization
+# hooks). Off by default. Enabled by this crate's dev-dependency so the test
+# build (lib + bin) has them; a release build has them neither compiled in
+# nor referenced, and the CI binary-scan job greps the release binary for
+# `RAMEN_TEST_` and fails if anything matches (`00-overview.md`).
+test-hooks = ["ramen-guard/test-hooks"]
+
 [dev-dependencies]
 tempfile = { workspace = true }
 futures = { workspace = true }
@@ -43,3 +52,7 @@ ramen-proto = { path = "../ramen-proto" }
 ramen-audit = { path = "../ramen-audit" }
 biscuit-auth = { workspace = true }
 serde_json = { workspace = true }
+# Self-dependency: enables `test-hooks` in the *test* build only, so the
+# e2e tests' `RAMEN_TEST_*` hooks exist in the test binary and in no
+# release build.
+ramen-supervisor = { path = ".", features = ["test-hooks"] }

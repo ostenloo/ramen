@@ -937,8 +937,11 @@ dependencies = [
 name = "ramen-guard"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "biscuit-auth",
+ "prost",
  "ramen-proto",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.20",
 ]
@@ -949,6 +952,9 @@ version = "0.1.0"
 dependencies = [
  "biscuit-auth",
  "clap",
+ "ramen-guard",
+ "ramen-proto",
+ "tempfile",
  "time",
 ]
 
@@ -991,6 +997,7 @@ dependencies = [
  "ramen-audit",
  "ramen-guard",
  "ramen-proto",
+ "ramen-supervisor",
  "security-framework",
  "serde",
  "serde_json",

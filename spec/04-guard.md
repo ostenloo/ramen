@@ -36,7 +36,7 @@ expires_at(2026-08-31T00:00:00Z);   # optional — see expiry convention
 ```
 
 **Expiry convention.** Token expiry is a `check` clause
-(`check if time($t), $t < ...`) — and check clauses are **not** in general
+(`check if date($t), $t < ...`) — and check clauses are **not** in general
 extractable: a token can carry several, in attenuation blocks, with arbitrary
 predicates. `ramen-mint issue --expires` writes both the `expires_at` fact and
 the time check. The check is authoritative; the fact is advisory metadata that
@@ -62,7 +62,7 @@ consult the issuer.
 ```datalog
 check if operation($op), $op == "FileWrite";
 check if path($p), $p.starts_with("/Users/austin/work/scratch");
-check if time($t), $t < 2026-08-31T00:00:00Z;
+check if date($t), $t < 2026-08-31T00:00:00Z;
 ```
 
 A sub-agent receives an attenuated token. The supervisor does not need to know
@@ -97,6 +97,7 @@ pub struct AuthzRequest<'a> {
 pub enum Decision {
     Allow,
     Deny { code: DenialCode, reason: String },
+    Indeterminate { reason: String },
 }
 
 impl Guard {
@@ -111,6 +112,20 @@ impl Guard {
 outcome of a working system, and `Result` invites `?` propagation that would
 merge denials into the error path. `01-protocol.md` §7 explains why that
 distinction matters; the type should enforce it.
+
+`Indeterminate` is the third outcome, for the case the first two cannot cover:
+the guard *could not reach a decision*. The datalog engine can fail the
+evaluation itself — a wall-clock limit under load, an engine-internal error —
+and that failure is not a denial: the token has not been shown to be
+insufficient, only that the guard could not finish checking. It refuses the
+operation (fail closed, exactly like `Deny`) but is **not classified** — the
+classification probes are differentials against a primary result, and a failed
+primary provides none (§5, §9). On the wire it maps to
+`Error/EvaluationIncomplete`, never `Denied`; in the audit log it is its own
+record kind. The distinction is operationally load-bearing: a burst of
+denials means a misconfigured agent, and a burst of indeterminates means the
+supervisor is under resource pressure or someone is feeding it pathological
+tokens — and the second is the one that is an attack.
 
 ### `RootKey`
 
@@ -141,7 +156,7 @@ Facts added by the supervisor, from **trusted** sources only:
 ```datalog
 operation("FileWrite");
 reversibility("Trivial");
-time(2026-08-30T14:07:33Z);
+date(2026-08-30T14:07:33Z);
 path("/Users/austin/work/notes.md");   // canonicalized — see §6
 ```
 
@@ -168,6 +183,26 @@ evaluates checks or policies, so it can never produce a denial and must never
 be used as the decision. (The M0 spike lost an hour to this: every denial
 looked like an allow until `authorize()` was called.)
 
+**Every authorizer is built with explicit evaluation limits, and an
+evaluation failure can never become a `Deny`.** biscuit-auth's datalog engine
+defaults to a **1 ms wall-clock limit** (`RunLimits::default`); under load, a
+perfectly valid token's evaluation can exceed it and the engine returns
+`Err(RunLimit(Timeout))` instead of a decision. Two layers of defense, in
+order: (1) the token depth cap (`07-delegation.md` §4) already bounds token
+complexity, so the guard raises the limits generously (seconds, not
+milliseconds) — which makes an engine-limit failure *rare*; (2) if an
+evaluation still does not complete, the guard returns `Indeterminate` (§3,
+§9) — which makes it *safe*. The second layer is the safety property: a
+`Deny` means the guard reached a decision and it was no; `Indeterminate`
+means it did not reach one, and the classification probes — differentials
+against a primary result — are meaningless without one. Raising the limits
+alone is not a fix, because wall-clock limits are load-dependent and 1 s under
+a bad enough scheduler is the same 1 ms problem with more headroom. Tests pin
+both edges: the defaults exceed biscuit's 1 ms floor, and a forced `RunLimit`
+error (zero time limit — deterministic, load-independent) yields
+`Indeterminate`, never `Deny`, and specifically never `TokenExpired` (the
+misclassification a primary-less probe run produced).
+
 **Facts must never be derived from client-supplied metadata.** The `client`
 field in `Hello` (`01-protocol.md` §5) is attacker-controlled and goes only to
 the audit record. Peer signing id likewise: it is recorded, not authorized on.
@@ -185,11 +220,52 @@ to `Allow`.
 ```rust
 fn authorize(&self, req: &AuthzRequest) -> Decision {
     match self.run_authorizer(req) {      // full run, `deny if true` trailer
-        Ok(()) => Decision::Allow,
-        Err(_) => Decision::Deny { code: self.classify(req), reason: ... },
+        Ok(allow) if allow => Decision::Allow,
+        // Evaluation **completed** with a no: a deny policy matched, or a
+        // check failed (biscuit reports check failures as
+        // `Err(FailedLogic)` — expiry is a check). Deterministic;
+        // classify by probing.
+        Ok(_) | Err(FailedLogic) => Decision::Deny { code: self.classify(req), .. },
+        // Token-derived engine faults (format, encoding, datalog language,
+        // term conversion, an unevaluatable expression in the token's own
+        // checks): the *token* failed, deterministically. Rejected.
+        Err(token_fault) => Decision::Deny { code: TokenRejected, .. },
+        // Machine-derived engine faults (RunLimit, internal): the
+        // evaluation did **not** complete; probes — differentials against a
+        // primary result — are meaningless. Fail closed, unclassified (§9).
+        Err(machine_fault) => Decision::Indeterminate { .., limits: self.eval_limits },
+        // Anything the guard does not recognize as token-fault or
+        // machine-fault — today: builder-side states (append/seal on a
+        // sealed token) that `authorize` never constructs. Indeterminate,
+        // never `panic!`: a panic in the guard is a supervisor crash
+        // triggered by an attacker-supplied token — every in-flight session
+        // drops. Fail closed, name the variant in the record (§9).
+        Err(unexpected) => Decision::Indeterminate { .., limits: self.eval_limits },
     }
 }
 ```
+
+The match is **exhaustive over the engine's error enum, with no wildcard
+arm.** A biscuit-auth bump that adds an error variant is a compile error
+here, to be classified deliberately as token-fault or machine-fault — not a
+new failure mode silently inheriting `Indeterminate` (the same reasoning as
+the encoding pins in `07-delegation.md` §5). The split is by *who* is at
+fault: token-derived faults are deterministic — the same token always fails
+the same way — and are denials of that token; machine-derived faults
+(engine limits under load, engine-internal errors) are not the token's
+fault and must never be dressed up as a denial of it.
+
+`Indeterminate` deliberately carries the evaluation limits — captured from
+the guard at decision time, i.e. the parameters the evaluation **actually
+ran under**, not a configuration read — and the reason names the engine's
+error. The unexpected-variant arm exists because "unreachable today" is an
+argument about what the library currently returns, and the whole point of
+the exhaustive match is not trusting that to stay true. The decision
+procedure has no panic path: a panic in the guard is a supervisor crash
+triggered by an attacker-supplied token, dropping every in-flight session —
+the worst outcome available. Reserve `panic!` for states where continuing
+would be *less* safe than stopping; an unrecognized engine error is not
+one.
 
 `classify` probes in order with `Authorizer::query`; the first probe that fires
 determines the code:
@@ -202,11 +278,17 @@ determines the code:
    denial was time-based → `TokenExpired`.
 4. Otherwise → `ConstraintViolated`.
 
+`TokenRejected` is **not** a probe outcome: it is assigned directly, before
+any probe, when the engine surfaces a token-derived fault (§5's match). A
+token whose format, encoding, datalog, or internal expressions the engine
+cannot process is rejected as a token, the way a token with a bad signature
+is rejected — not classified as if the evaluation had run.
+
 The time probe is **far-past, not far-future**. A "valid until" check
-(`time($t), $t < EXPIRY`) is satisfied only at times before the expiry: an
+(`date($t), $t < EXPIRY`) is satisfied only at times before the expiry: an
 expired token denied at `now` flips to allow at a far-past `now` and is still
 denied at a far-future `now`. A far-future probe would only fire for tokens
-with an *activation* window (`time($t) > START`), which `ramen-mint` never mints
+with an *activation* window (`date($t) > START`), which `ramen-mint` never mints
 in v0, so it is cut. The M0 spike verified the flip direction empirically.
 
 The `FailedLogic` error returned by `authorize()` names the exact failed check
@@ -279,9 +361,51 @@ Roughtime or a similar freshness source belongs. Do not build that now.
 
 ## 9. Failure handling
 
-`authorize` never panics and never returns early on internal error. If the token
-cannot be parsed, if the authorizer fails to run, if anything is unexpected: the
-result is `Deny`. There is no path from an internal fault to `Allow`.
+`authorize` never panics. There is no path from an internal fault to
+`Allow`, and there is no path from a failed evaluation to a classified
+`Deny`. The fault classes map to exactly three outcomes, decided by an
+**exhaustive match over the engine's error enum — no wildcard arm** (§5):
+
+- **The evaluation completed with a no** — the token lacks a capability, a
+  check failed, a `deny if true` matched. This is `Deny`, classified (§5).
+  Check failures (`FailedLogic`) are *completed* evaluations: the datalog ran
+  to a fixpoint and the check was evaluated. They are deterministic, and the
+  classification probes are valid differentials against them — which is
+  exactly how expiry is distinguished from other check failures. This split
+  rests on a structural assumption about the engine — that a failed check
+  surfaces as `Err(FailedLogic)`, not as a deny-policy match or a success —
+  and it is pinned by the test
+  `expired_token_denies_with_token_expired` (an expired token must classify
+  as `TokenExpired` through the probes, not fall into `Indeterminate`). If a
+  biscuit-auth bump changes how check failures surface, that test fails, and
+  its failure means the `FailedLogic` bucket — and therefore which failures
+  get classified at all — must be re-examined before the bump is accepted.
+  The test is the tripwire; this sentence is what its failure means.
+- **The evaluation completed and the token is at fault** — the engine
+  surfaced a token-derived failure (format, encoding, datalog language, term
+  conversion, an unevaluatable expression in the token's own checks).
+  This is `Deny/TokenRejected`, assigned directly without probing: the
+  token is rejected, like one with a bad signature.
+- **The evaluation did not complete** — an engine limit (`RunLimit`), an
+  engine-internal error, or an engine error the guard does not recognize as
+  a token fault (never a panic: see §5). This is `Indeterminate`: refuse
+  the operation (fail closed), do not classify, skip the classification
+  probes entirely — a probe result is only meaningful as a differential
+  against a primary result that exists. On the wire: `Error/
+  EvaluationIncomplete`. In the audit log: an `Indeterminate` record
+  carrying the reason, the **limits the evaluation actually ran under**
+  (captured in the decision, not read from configuration), and two advisory
+  streaks — the session's consecutive-indeterminate count and the
+  supervisor-wide one (`02-audit.md`): a load-induced burst is one
+  indeterminate on each of many sessions, so per-session counts read 1
+  while the supervisor-wide count climbs; a single pathological client
+  climbs the per-session count on one session only. A wall-clock-bounded
+  evaluation means a decision is no longer a pure function of token, facts,
+  and clock — it is also a function of machine load. A decision is therefore
+  **reproducible only in the absence of `Indeterminate`**: an auditor
+  re-running a completed decision gets the same answer; an `Indeterminate`
+  record is a flag that the machine, not the token, was the variable, and
+  the recorded limits say under what budget it ran.
 
 Token parsing happens before `authorize` (at handshake) and a parse failure is a
 handshake failure. But `authorize` still defends against a malformed token
@@ -301,6 +425,12 @@ async fn dispatch(ctx: &SessionCtx, req: Request) -> Response {
         Decision::Deny { code, reason } => {
             let seq = ctx.audit.append(&Record::denied(&req, code, &reason)).await?;
             Response::denied(req.id, code, reason, seq)
+        }
+        Decision::Indeterminate { reason } => {
+            // Failed evaluation: refuse, but as its own record kind and wire
+            // code, with the limits in force (§9).
+            let seq = ctx.audit.append(&Record::indeterminate(&req, &reason, limits)).await?;
+            Response::error(req.id, ErrorCode::EvaluationIncomplete, reason)
         }
         Decision::Allow => {
             ctx.audit.append(&Record::authorized(&req)).await?;   // BEFORE effect
@@ -329,6 +459,13 @@ convenient.
 - [ ] Token lacking the capability → `Deny/CapabilityNotGranted`, distinct from
       `ConstraintViolated` (classification order, §5).
 - [ ] Token signed by a non-root key → denied. Never allowed, never an error.
+- [ ] Forced engine-limit failure (zero time limit, deterministic) →
+      `Indeterminate`: the operation is refused, the wire response is
+      `Error/EvaluationIncomplete` (not `Denied`), the audit record is
+      `Indeterminate` with the limits in force, and the outcome is never
+      `Deny` — specifically never `TokenExpired`. A burst of these is
+      resource pressure or a pathological-token attack; it must stay
+      distinguishable from a burst of denials.
 - [ ] Malformed and truncated token bytes → denied, no panic. Fuzz this.
 - [ ] Path escaping the allowed prefix via `..` → denied at step 2, before any
       filesystem access. Assert no `stat` occurs (inject a filesystem trait, or

@@ -12,6 +12,7 @@
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::str::FromStr;
+use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -142,11 +143,41 @@ async fn run() -> i32 {
             return 1;
         }
     };
-    let guard = Arc::new(Guard::new(
-        Box::new(PublicKeyRootKey(root)),
-        control_plane,
-        Box::new(StdFs),
-    ));
+    let guard = Arc::new({
+        // Test hook (`test-hooks` feature, off by default): setting the
+        // datalog engine's time limit to zero makes every authorization
+        // evaluation fail with `RunLimit(Timeout)` deterministically —
+        // exercises the `Indeterminate` path end-to-end (`04-guard.md`
+        // §9). Never compiled into release builds; the CI binary-scan job
+        // asserts the hook is absent from the shipped binary.
+        #[cfg(feature = "test-hooks")]
+        if std::env::var_os("RAMEN_TEST_FORCE_EVAL_TIMEOUT").is_some() {
+            Guard::with_eval_limits(
+                Box::new(PublicKeyRootKey(root)),
+                control_plane,
+                Box::new(StdFs),
+                biscuit_auth::AuthorizerLimits {
+                    max_facts: 10_000,
+                    max_iterations: 10_000,
+                    max_time: Duration::from_secs(0),
+                },
+            )
+        } else {
+            Guard::new(
+                Box::new(PublicKeyRootKey(root)),
+                control_plane,
+                Box::new(StdFs),
+            )
+        }
+        #[cfg(not(feature = "test-hooks"))]
+        {
+            Guard::new(
+                Box::new(PublicKeyRootKey(root)),
+                control_plane,
+                Box::new(StdFs),
+            )
+        }
+    });
 
     // 3c. `FileWrite` effect prerequisites (`05-operations.md` M6):
     //     - the snapshots directory under the state dir;
@@ -229,6 +260,7 @@ async fn run() -> i32 {
         guard,
         limiter: Arc::new(RejectionLimiter::new()),
         shutdown: shutdown_rx,
+        indeterminate_streak: AtomicU32::new(0),
         config_prefixes,
         snapshots_dir,
     });

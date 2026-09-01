@@ -220,7 +220,9 @@ fn issue(
             // The check is authoritative; the fact is advisory metadata only
             // (Whoami reports it, nothing else reads it).
             src.push_str(&format!("expires_at({lit});\n"));
-            src.push_str(&format!("check if time($t), $t < {lit};\n"));
+            // `date` is the guard's clock fact (`04-guard.md` §4); a check on
+            // any other predicate is unresolvable and denies every request.
+            src.push_str(&format!("check if date($t), $t < {lit};\n"));
             Some(lit)
         }
         None => None,
