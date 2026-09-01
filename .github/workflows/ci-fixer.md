@@ -80,6 +80,12 @@ engine:
     # No API key: vLLM is unauthenticated on this host.
     COPILOT_PROVIDER_BASE_URL: "http://172.17.0.1:8000/v1"
     COPILOT_MODEL: qwen3.8-27b-awq
+    # The AWF api-proxy sidecar refuses to serve requests unless a provider
+    # key env var is present ("Set OPENAI_API_KEY, ... or
+    # COPILOT_PROVIDER_API_KEY to use the proxy" — 403 without it). The real
+    # value is isolated in the proxy sidecar; the agent only ever sees a
+    # dummy key, so a placeholder suffices for an unauthenticated vLLM.
+    COPILOT_PROVIDER_API_KEY: local-vllm-no-auth
 
 # AWF's API proxy has two model rewrites on by default, and both break a
 # self-hosted model that isn't in the built-in catalog:
