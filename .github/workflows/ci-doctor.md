@@ -65,6 +65,20 @@ network:
     - defaults
     - 172.17.0.1
 
+tools:
+  bash: true
+  github:
+    # This workflow's whole job is reading the logs of a failed run, and the
+    # default github MCP server exposes no workflow-runs/jobs/logs tools at
+    # all — run 33568390177 probed for them, found none, and had to file a
+    # log-less report saying so. gh-proxy drops the MCP server in favour of
+    # a pre-authenticated `gh` CLI (a "Start CLI Proxy" step carrying
+    # GH_TOKEN), which reaches the Actions API without opening
+    # api.github.com in network.allowed — the sandbox firewall blocks that
+    # by design. `toolsets` is deliberately omitted: it only configures the
+    # MCP server, which this mode does not start.
+    mode: gh-proxy
+
 safe-outputs:
   create-issue:
     title-prefix: "[CI failure] "
