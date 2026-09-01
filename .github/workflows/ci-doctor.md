@@ -12,6 +12,47 @@ on:
 
 if: ${{ github.event.workflow_run.conclusion == 'failure' }}
 
+engine:
+  id: copilot
+  env:
+    # vLLM (Qwen3-27B-AWQ) on this same host, reached through the docker
+    # bridge gateway — the agent runs in a container job on the
+    # self-hosted runner, so `localhost` is the container, not the host.
+    # No API key: vLLM is unauthenticated on this host.
+    COPILOT_PROVIDER_BASE_URL: "http://172.17.0.1:8000/v1"
+    COPILOT_MODEL: qwen3.8-27b-awq
+    # The AWF api-proxy sidecar refuses to serve requests unless a provider
+    # key env var is present (403 without it). The real value is isolated
+    # in the proxy sidecar; the agent only ever sees a dummy key, so a
+    # placeholder suffices for an unauthenticated vLLM.
+    COPILOT_PROVIDER_API_KEY: local-vllm-no-auth
+
+# AWF's API proxy has two model rewrites on by default, and both break a
+# self-hosted model that isn't in the built-in catalog:
+#   token-steering: proxy 403s ("authentication failed") instead of
+#     passing the request through to the provider
+#   model-fallback: proxy rewrites the unknown model to a catalog model,
+#     which vLLM answers with 404 model_not_found
+# Disable both so qwen3.8-27b-awq reaches vLLM verbatim.
+sandbox:
+  agent:
+    token-steering: false
+    model-fallback: false
+
+# The api-proxy 403s (max_cache_misses_exceeded) once it sees this many
+# consecutive responses with input_tokens > 0 and cache_read_tokens == 0.
+# vLLM never populates prompt_tokens_details.cached_tokens, so every turn
+# counts as a miss and the default of 5 kills the agent mid-run. Local
+# inference costs nothing, so this guardrail protects nothing here —
+# timeout-minutes and the turn cap are the real limits.
+max-turn-cache-misses: 500
+
+# Agent job runs on the self-hosted runner on the Fedora server (linux,
+# x86_64): gh-aw agent jobs require container jobs, which macOS runners
+# don't support, and vLLM lives on this host. Framework and safe-output
+# jobs stay on cloud.
+runs-on: [self-hosted, linux, x64]
+
 permissions:
   copilot-requests: write
   actions: read
@@ -19,13 +60,25 @@ permissions:
   issues: read
   pull-requests: read
 
+network:
+  allowed:
+    - defaults
+    - 172.17.0.1
+
 safe-outputs:
   create-issue:
     title-prefix: "[CI failure] "
     labels: [ci-failure]
   add-comment:
+  threat-detection:
+    # In BYOK mode the detection step calls the same provider URL as the
+    # agent — 172.17.0.1 is only reachable from this host, so it must run
+    # on the self-hosted runner too.
+    runs-on: [self-hosted, linux, x64]
 
-timeout-minutes: 10
+# Local Qwen is slower than the cloud model this workflow was written
+# against, and log triage is the token-heavy part of its job.
+timeout-minutes: 30
 source: githubnext/agentics/workflows/ci-doctor.md@578e0e0ea6291fed42a36d3fd46cec6a0e86afd8
 ---
 
