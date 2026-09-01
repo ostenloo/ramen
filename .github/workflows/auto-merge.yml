@@ -1,0 +1,139 @@
+name: auto-merge
+
+# Deterministic merge gate for [ci-fixer] PRs. Deliberately not an agent:
+# the lane conditions are mechanical and the merge is a git operation —
+# there is nothing here an LLM is better at doing.
+#
+# A PR is auto-merged only if EVERY condition holds:
+#   1. ci is green on the PR's current head SHA (this run)
+#   2. the PR came from the fixer: title starts with "[ci-fixer]" and the
+#      body carries the gh-aw workflow marker
+#   3. additions + deletions <= 50 (syntax-class fixes are small; anything
+#      bigger is a judgment call and goes to a human)
+#   4. no protected paths: .github/ spec/ deploy/ and the two core-crate
+#      source trees (ramen-proto/src, ramen-guard/src) — wire format and
+#      guard logic never merge without a human
+#   5. no test files or build files: */tests/* (includes the adversarial
+#      and golden corpora), *test*.rs, Cargo.toml/lock, *.md — the classic
+#      auto-merge failure is "fixing the test to match the bug", which is
+#      small, compiles, and makes CI green; this gate exists to block it
+#   6. no "spec: n/a" exemption in any commit message — an agent granting
+#      itself a spec-drift exemption is self-authorization
+#
+# Any failure lands the PR with a "needs-human" label and a comment saying
+# which condition failed. The job itself succeeds either way: a lane
+# rejection is an expected outcome, not an error.
+#
+# Token: GH_AW_CI_TRIGGER_TOKEN — a fine-grained PAT on this repo with
+# Contents: R/W, Pull requests: R/W, Issues: R/W. The fixer workflow uses
+# the same secret to push its branch (GitHub does not trigger workflows on
+# pushes made with the workflow token, so the PR would never get CI without
+# it). Until that secret exists, this workflow is a no-op.
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+concurrency:
+  group: auto-merge-${{ github.event.workflow_run.head_ref }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Locate the PR for this head
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GH_AW_CI_TRIGGER_TOKEN }}
+        run: |
+          set -euo pipefail
+          HEAD_REF="${{ github.event.workflow_run.head_ref }}"
+          HEAD_SHA="${{ github.event.workflow_run.head_sha }}"
+          PRS=$(gh pr list --head "$HEAD_REF" --state open \
+            --json number,headRefOid \
+            --jq ".[] | select(.headRefOid == \"$HEAD_SHA\") | .number")
+          COUNT=$(echo "$PRS" | grep -c . || true)
+          if [ "$COUNT" -eq 0 ]; then
+            echo "no open PR at this SHA (stale or already merged); nothing to do"
+            exit 0
+          fi
+          if [ "$COUNT" -gt 1 ]; then
+            echo "refusing: multiple open PRs on $HEAD_REF" >&2
+            exit 1
+          fi
+          echo "number=$PRS" >> "$GITHUB_OUTPUT"
+
+      - name: Evaluate the lane
+        id: lane
+        if: steps.pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_AW_CI_TRIGGER_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          set -uo pipefail
+          out() { echo "pass=false" >> "$GITHUB_OUTPUT"; echo "reason=$1" >> "$GITHUB_OUTPUT"; exit 0; }
+
+          DATA=$(gh pr view "$PR_NUMBER" --json title,body,additions,deletions,files,commits)
+          TITLE=$(jq -r .title <<<"$DATA")
+          BODY=$(jq -r .body <<<"$DATA")
+          DIFF=$(jq '.additions + .deletions' <<<"$DATA")
+
+          # Condition 2: provenance — fixer title + gh-aw marker in body.
+          case "$TITLE" in
+            "[ci-fixer]"*) ;;
+            *) out "title is not a [ci-fixer] PR" ;;
+          esac
+          grep -q "gh-aw-workflow-id" <<<"$BODY" || out "no gh-aw marker in PR body (not from the fixer workflow)"
+
+          # Condition 3: size.
+          [ "$DIFF" -le 50 ] || out "diff is $DIFF lines (lane limit 50)"
+
+          # Conditions 4 and 5: file paths.
+          for f in $(jq -r '.files[].path' <<<"$DATA"); do
+            case "$f" in
+              .github/*|spec/*|deploy/*|crates/ramen-proto/src/*|crates/ramen-guard/src/*)
+                out "protected path: $f" ;;
+              */tests/*|*test*.rs|Cargo.toml|*/Cargo.toml|Cargo.lock|*.md)
+                out "test or build file: $f" ;;
+            esac
+          done
+
+          # Condition 6: no self-granted spec-drift exemption.
+          MSGS=$(jq -r '.commits[] | .messageHeadline + "\n" + (.messageBody // "")' <<<"$DATA")
+          grep -qi "spec: n/a" <<<"$MSGS" && out "commit message contains a self-granted 'spec: n/a' exemption"
+
+          echo "pass=true" >> "$GITHUB_OUTPUT"
+          echo "reason=all lane conditions met" >> "$GITHUB_OUTPUT"
+
+      - name: Merge or queue for human review
+        if: steps.pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_AW_CI_TRIGGER_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          LANE_PASS: ${{ steps.lane.outputs.pass }}
+          LANE_REASON: ${{ steps.lane.outputs.reason }}
+        run: |
+          set -euo pipefail
+          if [ "$LANE_PASS" = "true" ]; then
+            echo "auto-merging #$PR_NUMBER: $LANE_REASON"
+            gh pr merge "$PR_NUMBER" --squash --delete-branch
+          else
+            echo "lane failed for #$PR_NUMBER: $LANE_REASON"
+            gh pr edit "$PR_NUMBER" --add-label "needs-human"
+            gh pr comment "$PR_NUMBER" --body \
+              "Auto-merge lane failed: **$LANE_REASON** — queued for human review."
+          fi

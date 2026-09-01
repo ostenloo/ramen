@@ -58,6 +58,23 @@ on:
             core.setOutput('has_issues', 'false');
           }
 
+engine:
+  id: copilot
+  env:
+    # vLLM (Qwen3-27B-AWQ) on this same host, reached through the docker
+    # bridge gateway — the agent runs in a container job on the
+    # self-hosted runner, so `localhost` is the container, not the host.
+    # Verified: bridge-network container -> 172.17.0.1:8000 works.
+    # No API key: vLLM is unauthenticated on this host.
+    COPILOT_PROVIDER_BASE_URL: "http://172.17.0.1:8000/v1"
+    COPILOT_MODEL: qwen3.8-27b-awq
+
+# Agent job runs on the self-hosted runner on the Fedora server (linux,
+# x86_64): gh-aw agent jobs require container jobs, which macOS runners
+# don't support, and vLLM lives on this host. Framework and safe-output
+# jobs stay on cloud.
+runs-on: [self-hosted, linux, x64]
+
 permissions:
   copilot-requests: write
   contents: read
@@ -67,7 +84,10 @@ permissions:
 
 if: needs.pre_activation.outputs.has_issues == 'true'
 
-network: defaults
+network:
+  allowed:
+    - defaults
+    - 172.17.0.1
 
 tools:
   bash: true
@@ -78,6 +98,11 @@ safe-outputs:
   create-pull-request:
     expires: 7d
     title-prefix: "[ci-fixer] "
+  threat-detection:
+    # In BYOK mode the detection step calls the same provider URL as the
+    # agent — 172.17.0.1 is only reachable from this host, so it must run
+    # on the self-hosted runner too.
+    runs-on: [self-hosted, linux, x64]
   add-labels:
     allowed: [ci-fix-in-progress]
     max: 1
@@ -129,17 +154,20 @@ ${{ needs.pre_activation.outputs.issue_body }}
 4. **Implement the fix**:
    - Work in the checked-out repository.
    - Make the smallest change that addresses the root cause.
-   - Run the test suite (`cargo test --workspace`) and clippy
-     (`cargo clippy --workspace`) to verify. This repository is macOS-only
-     by construction; only fix things the failure diagnosis supports.
-   - If the tests cannot be run or do not pass, stop: comment on the issue
-     and use `noop`.
+   - This runner is Linux and this workspace is macOS-only by
+     construction — `cargo test --workspace` cannot run here, so do NOT
+     attempt to build or test the workspace. Verification happens in the
+     repository's CI (macOS) on the pull request. Do not open a PR for a
+     change you cannot argue is correct from the failure diagnosis.
+   - If you are not confident the change is correct, stop: comment on the
+     issue and use `noop`.
 
 5. **Open the pull request**: use the `create_pull_request` safe-output tool.
    The PR body must include:
    - which issue it fixes (`Fixes #${{ needs.pre_activation.outputs.issue_number }}`)
    - a short explanation of the root cause and the change
-   - the verification you ran (test/clippy results)
+   - a note that local verification is unavailable on this Linux runner and
+     the change is verified by the repository's CI
 
 6. **Report back**: use the `add_comment` safe-output tool to comment the PR
    link on the issue, then use the `close_issue` safe-output tool to close the
