@@ -81,6 +81,18 @@ engine:
     COPILOT_PROVIDER_BASE_URL: "http://172.17.0.1:8000/v1"
     COPILOT_MODEL: qwen3.8-27b-awq
 
+# AWF's API proxy has two model rewrites on by default, and both break a
+# self-hosted model that isn't in the built-in catalog:
+#   token-steering: proxy intercepts the request and 403s ("authentication
+#     failed") instead of passing it through to the provider
+#   model-fallback: proxy rewrites the unknown model to a catalog model,
+#     which vLLM answers with 404 model_not_found
+# Disable both so qwen3.8-27b-awq reaches vLLM verbatim.
+sandbox:
+  agent:
+    token-steering: false
+    model-fallback: false
+
 # Agent job runs on the self-hosted runner on the Fedora server (linux,
 # x86_64): gh-aw agent jobs require container jobs, which macOS runners
 # don't support, and vLLM lives on this host. Framework and safe-output
