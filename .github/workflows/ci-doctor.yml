@@ -69,19 +69,20 @@ jobs:
           # fall back to the CLI, which handles the redirect itself. Errors are
           # printed rather than swallowed: a silent "could not fetch logs" tells
           # you nothing when it happens in a scheduled run.
-          if gh api "repos/$REPO/actions/jobs/$JOB_ID/logs" > raw.log 2>err.txt && [ -s raw.log ]; then
+          # `gh run view --log` is primary. The REST endpoint is kept only as a
+          # fallback: `gh api` refuses a response containing terminal escape
+          # sequences ("pass --allow-escape-sequences to output it anyway"),
+          # and cargo colours its output, so REST fails on exactly the logs
+          # this workflow exists to read. That flag is also too new to rely on.
+          if gh run view --repo "$REPO" --job "$JOB_ID" --log > raw.log 2>err.txt && [ -s raw.log ]; then
+            echo "log source: gh run view"
+            SOURCE=cli
+          elif gh api "repos/$REPO/actions/jobs/$JOB_ID/logs" > raw.log 2>err.txt && [ -s raw.log ]; then
             echo "log source: REST"
             SOURCE=rest
           else
-            echo "REST log fetch failed:"; sed 's/^/  /' err.txt || true
-            if gh run view --repo "$REPO" --job "$JOB_ID" --log > raw.log 2>err.txt && [ -s raw.log ]; then
-              echo "log source: gh run view"
-              SOURCE=cli
-            else
-              echo "CLI log fetch also failed:"; sed 's/^/  /' err.txt || true
-              echo "no log available for job $JOB_ID; nothing to triage"
-              exit 0
-            fi
+            echo "could not fetch logs for job $JOB_ID:"; sed 's/^/  /' err.txt || true
+            exit 0
           fi
 
           # The CLI prefixes every line with "job<TAB>step<TAB>"; REST does
@@ -130,9 +131,14 @@ jobs:
           # competing on document order.
           DIAGNOSTIC='^(error(\[[A-Z0-9]+\])?:|FAILED|panicked at|thread .* panicked)'
           GENERIC='^##\[error\]'
-          START=$(grep -nE "$DIAGNOSTIC" clean.log | head -1 | cut -d: -f1)
+          # `|| true` on both: under `set -o pipefail` these pipelines fail
+          # either when grep matches nothing (exit 1) or when `head -1` closes
+          # the pipe early and grep takes SIGPIPE -- the latter racy on match,
+          # which killed run 33579386074 outright.
+          first_line() { grep -nE "$1" clean.log 2>/dev/null | head -1 | cut -d: -f1 || true; }
+          START=$(first_line "$DIAGNOSTIC")
           if [ -z "$START" ]; then
-            START=$(grep -nE "$GENERIC" clean.log | head -1 | cut -d: -f1)
+            START=$(first_line "$GENERIC")
             [ -n "$START" ] && echo "no toolchain diagnostic found; falling back to the runner's error line"
           fi
           TRUNCATED=""
