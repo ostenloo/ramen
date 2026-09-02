@@ -108,13 +108,17 @@ jobs:
           # BOM is stripped globally, not just line 1: the CLI emits one at
           # every step boundary, and a BOM ahead of a timestamp defeats the
           # anchored timestamp strip.
-          ESC=$(printf '\033')
           BOM=$(printf '\357\273\277')
-          sed -e "s/${BOM}//g" \
-              -e "s/${ESC}\[[0-9;]*[a-zA-Z]//g" \
-              -e 's/^[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}T[0-9:.]*Z //' \
-              stripped.log > clean.log
+          tr -d '\033' < stripped.log \
+            | sed -e "s/${BOM}//g" \
+                  -e 's/\[[0-9;]*m//g' \
+                  -e 's/^[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}T[0-9:.]*Z //' \
+            > clean.log
           echo "log lines: $(wc -l < clean.log)  source: $SOURCE"
+          # If any ESC survived, the colour strip has regressed and every
+          # cargo diagnostic will silently fail to match at column 0.
+          ESC_LEFT=$(grep -c "$(printf '\033')" clean.log || true)
+          [ "$ESC_LEFT" = 0 ] || echo "WARNING: $ESC_LEFT lines still contain ESC after cleaning"
 
           # First error block: 20 lines from the first error marker. Cargo puts
           # the diagnostic, the source span, and clippy's suggested fix inside
