@@ -8,7 +8,10 @@ knob (the one that did -- the cache-miss cap -- is now the
 Run this after every compile. It is idempotent and asserts on every
 substitution, so a silent partial patch is not possible.
 
-    python3 .github/scripts/patch-locks.py [workflow ...]   # default: ci-fixer ci-doctor
+ci-fixer is the only agentic workflow left; ci-doctor is plain YAML
+(ci-doctor.yml) and needs no patching.
+
+    python3 .github/scripts/patch-locks.py [workflow ...]   # default: ci-fixer
 
 Background for each patch is in the commit history (see cc4a50d,
 d7b4025, d608e40, 414689c, a9d2f35).
@@ -149,7 +152,7 @@ def patch(path):
 
 
 def main():
-    names = sys.argv[1:] or ["ci-fixer", "ci-doctor"]
+    names = sys.argv[1:] or ["ci-fixer"]
     root = pathlib.Path(__file__).resolve().parents[2] / ".github" / "workflows"
     for name in names:
         path = root / f"{name}.lock.yml"

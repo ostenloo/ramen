@@ -46,7 +46,17 @@ on:
 
             // Process one issue per run, oldest first.
             const issue = res.data.items[0];
-            const body = (issue.body || '').replace(/\s+/g, ' ').trim().slice(0, 3000);
+            // Budget is generous because a silent cut is worse than a long
+            // prompt: at 3000 chars this severed ci-doctor's warning that
+            // fixing one clippy lint could expose a second (issue #10 was
+            // 5364 chars), the agent opened #12 asserting the fix was
+            // complete, and CI went red on exactly that second lint. The
+            // marker makes any future cut visible to the agent.
+            const RAW = (issue.body || '').replace(/\s+/g, ' ').trim();
+            const LIMIT = 12000;
+            const body = RAW.length > LIMIT
+              ? RAW.slice(0, LIMIT) + ' […truncated: read the issue directly for the rest]'
+              : RAW;
             core.info(`Selected issue #${issue.number}: ${issue.title}`);
             core.setOutput('has_issues', 'true');
             core.setOutput('issue_number', String(issue.number));

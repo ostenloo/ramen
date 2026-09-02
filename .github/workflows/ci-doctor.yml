@@ -1,0 +1,129 @@
+name: ci-doctor
+
+# Deterministic CI triage. Deliberately not an agent, for the same reason
+# auto-merge.yml is not one: finding the earliest failed job, pulling its
+# log, and cutting out the first error block is mechanical work with a
+# single correct answer.
+#
+# The agent version (gh-aw + local vLLM) was replaced because the enrichment
+# it added — cross-run correlation, tracing a line to its introducing commit
+# — was not reaching the only consumer that acts on these issues. ci-fixer
+# truncates the issue body, and issue #10's report was 5364 chars against a
+# 3000-char budget: 44% was discarded, including the warning that fixing the
+# first lint would expose a second one. It did, and #12 went red on it.
+# A terse mechanical report fits inside the budget by construction.
+#
+# What was genuinely lost: the "why", and repo-wide sweeps for other
+# instances of the same lint. Fingerprinting recovers the dedup half.
+# Humans still get the run link for anything deeper.
+#
+# Runs in seconds on ubuntu-latest, which also frees the self-hosted runner
+# and vLLM entirely for ci-fixer, and leaves ci-fixer as the only workflow
+# needing the post-compile AWF patches.
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  actions: read
+  contents: read
+  issues: write
+
+concurrency:
+  group: ci-doctor-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  triage:
+    if: github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Diagnose the failure and file or update an issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          RUN_NUMBER: ${{ github.event.workflow_run.run_number }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+
+          # Earliest failed job: later failures are usually consequences of it.
+          JOB=$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100" \
+            --jq '[.jobs[] | select(.conclusion=="failure")] | sort_by(.started_at) | .[0]')
+          if [ -z "$JOB" ] || [ "$JOB" = "null" ]; then
+            echo "run concluded failure but no job did (cancelled or infrastructure); nothing to triage"
+            exit 0
+          fi
+          JOB_ID=$(jq -r .id <<<"$JOB")
+          JOB_NAME=$(jq -r .name <<<"$JOB")
+          JOB_URL=$(jq -r .html_url <<<"$JOB")
+          echo "earliest failed job: $JOB_NAME ($JOB_ID)"
+
+          # Raw log, minus BOM, ANSI colour, and per-line timestamps.
+          gh api "repos/$REPO/actions/jobs/$JOB_ID/logs" > raw.log 2>/dev/null || {
+            echo "could not fetch logs for job $JOB_ID"; exit 0; }
+          sed -e '1s/^\xEF\xBB\xBF//' \
+              -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' \
+              -e 's/^[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}T[0-9:.]*Z //' \
+              raw.log > clean.log
+
+          # First error block: 20 lines from the first error marker. Cargo puts
+          # the diagnostic, the source span, and clippy's suggested fix inside
+          # that window. Anything that does not match falls back to the tail.
+          PATTERN='^(error(\[[A-Z0-9]+\])?:|FAILED|panicked|##\[error\])'
+          if grep -qE "$PATTERN" clean.log; then
+            awk -v p="$PATTERN" 'BEGIN{n=0} $0 ~ p {f=1} f{print; n++; if(n>=20) exit}' \
+              clean.log > excerpt.txt
+            TRUNCATED=""
+          else
+            tail -n 20 clean.log > excerpt.txt
+            TRUNCATED=$'\n\n_No line matched a known error marker; showing the last 20 lines of the job log._'
+          fi
+
+          # Fingerprint on job + the first 3 lines of the excerpt, so the same
+          # failure recurring across pushes collapses onto one issue instead of
+          # filing a fresh one every time (14 duplicates before this existed).
+          FP=$(printf '%s\n%s' "$JOB_NAME" "$(head -3 excerpt.txt)" \
+            | sha256sum | cut -c1-16)
+          MARKER="<!-- ci-doctor-fingerprint: $FP -->"
+          echo "fingerprint: $FP"
+
+          {
+            echo "**Job \`$JOB_NAME\` failed** on \`main\` — [run #$RUN_NUMBER]($RUN_URL) at \`${HEAD_SHA:0:12}\`."
+            echo
+            echo "First error in [the job log]($JOB_URL):"
+            echo
+            echo '```'
+            cat excerpt.txt
+            echo '```'
+            printf '%s' "$TRUNCATED"
+            echo
+            echo "Note: clippy and rustc abort a crate at its first error, so fixing this"
+            echo "may expose a further failure in a crate that was never reached."
+            echo
+            echo "Filed by ci-doctor (deterministic; no model involved). The excerpt is the"
+            echo "first error block, not necessarily the root cause — check the full log if"
+            echo "it does not explain itself."
+            echo
+            echo "$MARKER"
+          } > body.md
+
+          # Update the existing issue for this fingerprint if one is open.
+          EXISTING=$(gh issue list --repo "$REPO" --label ci-failure --state open \
+            --limit 100 --json number,body \
+            --jq "[.[] | select(.body | contains(\"$FP\"))] | .[0].number // empty")
+
+          if [ -n "$EXISTING" ]; then
+            echo "same failure as open issue #$EXISTING; commenting"
+            gh issue comment "$EXISTING" --repo "$REPO" --body \
+              "Still failing as of [run #$RUN_NUMBER]($RUN_URL) (\`${HEAD_SHA:0:12}\`)."
+          else
+            TITLE="[CI failure] $JOB_NAME: $(head -1 excerpt.txt | cut -c1-110)"
+            gh issue create --repo "$REPO" --title "$TITLE" \
+              --label ci-failure --body-file body.md
+          fi
