@@ -130,6 +130,15 @@ jobs:
           set -euo pipefail
           if [ "$LANE_PASS" = "true" ]; then
             echo "auto-merging #$PR_NUMBER: $LANE_REASON"
+            # ci-fixer opens drafts (gh-aw's create-pull-request defaults to
+            # draft: true) and GitHub refuses to merge a draft, so without
+            # this every lane-passing PR would clear all six conditions and
+            # then die at the merge call. Promoting here rather than setting
+            # draft: false on the fixer keeps the draft state meaningful:
+            # it marks a PR no deterministic check has cleared yet, so a
+            # rejected PR stays a draft wearing needs-human. Idempotent --
+            # a PR already marked ready just returns an error we ignore.
+            gh pr ready "$PR_NUMBER" 2>/dev/null || true
             gh pr merge "$PR_NUMBER" --squash --delete-branch
           else
             echo "lane failed for #$PR_NUMBER: $LANE_REASON"
