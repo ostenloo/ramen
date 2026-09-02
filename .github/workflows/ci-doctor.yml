@@ -119,6 +119,9 @@ jobs:
           # cargo diagnostic will silently fail to match at column 0.
           ESC_LEFT=$(grep -c "$(printf '\033')" clean.log || true)
           [ "$ESC_LEFT" = 0 ] || echo "WARNING: $ESC_LEFT lines still contain ESC after cleaning"
+          echo "--- normalisation probe (first 80 bytes of a diagnostic line) ---"
+          grep -n 'error' clean.log | head -2 | cut -c1-80 | od -c | head -8
+          echo "--- end probe ---"
 
           # First error block: 20 lines from the first error marker. Cargo puts
           # the diagnostic, the source span, and clippy's suggested fix inside
