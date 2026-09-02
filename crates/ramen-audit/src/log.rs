@@ -408,7 +408,7 @@ pub(crate) fn writer_loop(
             None
         };
 
-        for (outcome, job) in outcomes.into_iter().zip(batch.into_iter()) {
+        for (outcome, job) in outcomes.into_iter().zip(batch) {
             let final_outcome = match (&fatal, &sync_err) {
                 (Some(e), _) | (None, Some(e)) => Err(e.clone()),
                 (None, None) => outcome,
