@@ -8,6 +8,16 @@ on:
   push:
   pull_request:
 
+# cargo colours its diagnostics here even though the runner is not a TTY,
+# which splits "error" from its colon with escape sequences
+# (error<ESC>[0m<ESC>[1m:) and makes the log unparseable without exactly
+# correct ANSI stripping. ci-doctor reads these logs to identify failures --
+# GitHub's annotations API only exposes "Process completed with exit code
+# 101", since there is no Rust problem matcher -- so emit plain text at the
+# source rather than reconstructing it downstream.
+env:
+  CARGO_TERM_COLOR: never
+
 jobs:
   test:
     runs-on: macos-latest

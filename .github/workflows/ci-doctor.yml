@@ -96,32 +96,25 @@ jobs:
           # left alone.
           if [ "$SOURCE" = cli ]; then cut -f3- raw.log > stripped.log; else cp raw.log stripped.log; fi
 
-          # ESC and BOM are written as literal bytes by printf rather than as
-          # \x1b / \xEF escapes: whether sed interprets those is
-          # implementation-dependent, and when it does not the failure is
-          # silent. cargo colours its diagnostics, so an unstripped ESC sits
-          # between the timestamp and the word "error" -- the line stops
-          # matching ^error:, and the first thing left matching at column 0 is
-          # the runner's own uncoloured "##[error]Process completed with exit
-          # code 101", which is what runs 33578330457 and 33578615213
-          # reported as the diagnosis.
+          # Colour is disabled at the source (CARGO_TERM_COLOR: never in
+          # ci.yaml), because cargo splits "error" from its colon with escape
+          # sequences and reconstructing that downstream cost several wrong
+          # diagnoses. The colour strip stays as a belt-and-braces measure for
+          # any tool that ignores CARGO_TERM_COLOR, and is asserted below.
           # BOM is stripped globally, not just line 1: the CLI emits one at
           # every step boundary, and a BOM ahead of a timestamp defeats the
           # anchored timestamp strip.
           BOM=$(printf '\357\273\277')
           tr -d '\033' < stripped.log \
-            | sed -e "s/${BOM}//g" \
-                  -e 's/\[[0-9;]*m//g' \
-                  -e 's/^[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}T[0-9:.]*Z //' \
+            | sed -E -e "s/${BOM}//g" \
+                     -e 's/\^?\[[0-9;]*m//g' \
+                     -e 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]*Z //' \
             > clean.log
           echo "log lines: $(wc -l < clean.log)  source: $SOURCE"
-          # If any ESC survived, the colour strip has regressed and every
-          # cargo diagnostic will silently fail to match at column 0.
-          ESC_LEFT=$(grep -c "$(printf '\033')" clean.log || true)
-          [ "$ESC_LEFT" = 0 ] || echo "WARNING: $ESC_LEFT lines still contain ESC after cleaning"
-          echo "--- normalisation probe (first 80 bytes of a diagnostic line) ---"
-          grep -n 'error' clean.log | head -2 | cut -c1-80 | od -c | head -8
-          echo "--- end probe ---"
+          # Colour codes surviving here is the exact failure that produced
+          # four wrong reports, so say so loudly rather than degrading.
+          DIRTY=$(grep -cE "$(printf '\033')|\^\[[0-9;]*m" clean.log || true)
+          [ "$DIRTY" = 0 ] || echo "WARNING: $DIRTY lines still contain escape sequences after cleaning"
 
           # First error block: 20 lines from the first error marker. Cargo puts
           # the diagnostic, the source span, and clippy's suggested fix inside
@@ -136,7 +129,12 @@ jobs:
           # of every failed step and explains nothing -- so that generic line
           # is only consulted when nothing better exists, rather than
           # competing on document order.
-          DIAGNOSTIC='^(error(\[[A-Z0-9]+\])?:|FAILED|panicked at|thread .* panicked)'
+          # The "error:" arm is deliberately unanchored. Requiring column 0 is
+          # what failed four times: any residue left in front of the word --
+          # a timestamp, a job/step prefix, a colour code -- silently demotes
+          # the match. Requiring the colon and a following space is enough to
+          # avoid false hits like curl's --show-error.
+          DIAGNOSTIC='error(\[[A-Z0-9]+\])?:[[:space:]]|^(FAILED|panicked at)|thread .* panicked'
           GENERIC='^##\[error\]'
           # `|| true` on both: under `set -o pipefail` these pipelines fail
           # either when grep matches nothing (exit 1) or when `head -1` closes
