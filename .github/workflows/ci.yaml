@@ -122,7 +122,16 @@ jobs:
           set -euo pipefail
           if [ -n "$BASE_REF" ]; then
             RANGE="origin/$BASE_REF...HEAD"
-          elif [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+          elif [ -n "$BEFORE" ] \
+               && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] \
+               && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            # cat-file -e is an existence test: a force-push rewrites history,
+            # so github.event.before can name a commit that no longer exists,
+            # and `git diff <missing>..HEAD` is a fatal error that takes the
+            # whole job down under `set -e`. That is a crash, not a drift
+            # finding, and it fired on every rebased branch. Falling through
+            # compares against the default branch instead -- the correct base
+            # for a rebased branch anyway, so the check still does its job.
             RANGE="$BEFORE..HEAD"
           else
             # First push of a new branch: compare against the default branch.
