@@ -8,13 +8,19 @@ on:
   push:
   pull_request:
 
-# cargo colours its diagnostics here even though the runner is not a TTY,
-# which splits "error" from its colon with escape sequences
-# (error<ESC>[0m<ESC>[1m:) and makes the log unparseable without exactly
-# correct ANSI stripping. ci-doctor reads these logs to identify failures --
-# GitHub's annotations API only exposes "Process completed with exit code
-# 101", since there is no Rust problem matcher -- so emit plain text at the
-# source rather than reconstructing it downstream.
+# Keep CARGO_TERM_COLOR=never unless you also check .github/workflows/ci-doctor.yml.
+#
+# cargo colours its diagnostics here even though the runner is not a TTY, and
+# the escapes land *between* "error" and its colon (error<ESC>[0m<ESC>[1m:),
+# so the string "error:" does not occur in the raw log at all. ci-doctor reads
+# these logs to identify what failed -- GitHub's annotations API only exposes
+# "Process completed with exit code 101", because there is no Rust problem
+# matcher -- and it filed five useless issues before this was found.
+#
+# ci-doctor also strips colour itself, so removing this will not break it
+# outright; it removes one of two layers, and a degraded report says so
+# explicitly rather than failing. If you want the colour back, verify
+# ci-doctor still names the failing file and line before merging.
 env:
   CARGO_TERM_COLOR: never
 
