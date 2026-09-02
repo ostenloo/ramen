@@ -252,10 +252,9 @@ fn identifier_mismatch_rejected_with_identity_rejected() {
     // getsockopt(LOCAL_PEERTOKEN) runs → ENOTCONN → fail-closed, no peer).
     let rejected = records
         .iter()
-        .filter(|r| {
+        .rfind(|r| {
             matches!(r, ramen_audit::Record::Event(e) if e.kind == RecordKind::IdentityRejected)
         })
-        .next_back()
         .expect("IdentityRejected in audit");
     let ramen_audit::Record::Event(rejected) = rejected else {
         unreachable!()
