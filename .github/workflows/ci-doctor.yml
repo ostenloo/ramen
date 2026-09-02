@@ -101,12 +101,20 @@ jobs:
           # First error block: 20 lines from the first error marker. Cargo puts
           # the diagnostic, the source span, and clippy's suggested fix inside
           # that window. Anything that does not match falls back to the tail.
+          # grep for the line number, then sed the window. Deliberately not
+          # awk: `awk -v p='...\[...'` processes backslash escapes in the
+          # assignment, so the pattern awk compiles is not the one written
+          # here. That silently produced an empty excerpt in run 33577738204
+          # while grep -q on the same pattern matched fine.
           PATTERN='^(error(\[[A-Z0-9]+\])?:|FAILED|panicked|##\[error\])'
-          if grep -qE "$PATTERN" clean.log; then
-            awk -v p="$PATTERN" 'BEGIN{n=0} $0 ~ p {f=1} f{print; n++; if(n>=20) exit}' \
-              clean.log > excerpt.txt
-            TRUNCATED=""
-          else
+          START=$(grep -nE "$PATTERN" clean.log | head -1 | cut -d: -f1)
+          TRUNCATED=""
+          if [ -n "$START" ]; then
+            sed -n "${START},$((START + 19))p" clean.log > excerpt.txt
+          fi
+          # Also covers the case where the window came back empty for any
+          # other reason -- an empty excerpt is never worth filing.
+          if [ ! -s excerpt.txt ]; then
             tail -n 20 clean.log > excerpt.txt
             TRUNCATED=$'\n\n_No line matched a known error marker; showing the last 20 lines of the job log._'
           fi
@@ -149,7 +157,8 @@ jobs:
             gh issue comment "$EXISTING" --repo "$REPO" --body \
               "Still failing as of [run #$RUN_NUMBER]($RUN_URL) (\`${HEAD_SHA:0:12}\`)."
           else
-            TITLE="[CI failure] $JOB_NAME: $(head -1 excerpt.txt | cut -c1-110)"
+            SUMMARY=$(grep -m1 -v '^[[:space:]]*$' excerpt.txt | cut -c1-110)
+            TITLE="[CI failure] $JOB_NAME${SUMMARY:+: $SUMMARY}"
             gh issue create --repo "$REPO" --title "$TITLE" \
               --label ci-failure --body-file body.md
           fi
