@@ -95,11 +95,22 @@ jobs:
           # left alone.
           if [ "$SOURCE" = cli ]; then cut -f3- raw.log > stripped.log; else cp raw.log stripped.log; fi
 
-          # BOM is stripped globally, not just on line 1: the CLI emits one at
-          # every step boundary, and a BOM ahead of a timestamp blocks the
-          # timestamp strip below.
-          sed -e 's/\xEF\xBB\xBF//g' \
-              -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' \
+          # ESC and BOM are written as literal bytes by printf rather than as
+          # \x1b / \xEF escapes: whether sed interprets those is
+          # implementation-dependent, and when it does not the failure is
+          # silent. cargo colours its diagnostics, so an unstripped ESC sits
+          # between the timestamp and the word "error" -- the line stops
+          # matching ^error:, and the first thing left matching at column 0 is
+          # the runner's own uncoloured "##[error]Process completed with exit
+          # code 101", which is what runs 33578330457 and 33578615213
+          # reported as the diagnosis.
+          # BOM is stripped globally, not just line 1: the CLI emits one at
+          # every step boundary, and a BOM ahead of a timestamp defeats the
+          # anchored timestamp strip.
+          ESC=$(printf '\033')
+          BOM=$(printf '\357\273\277')
+          sed -e "s/${BOM}//g" \
+              -e "s/${ESC}\[[0-9;]*[a-zA-Z]//g" \
               -e 's/^[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}T[0-9:.]*Z //' \
               stripped.log > clean.log
           echo "log lines: $(wc -l < clean.log)  source: $SOURCE"
@@ -112,10 +123,21 @@ jobs:
           # assignment, so the pattern awk compiles is not the one written
           # here. That silently produced an empty excerpt in run 33577738204
           # while grep -q on the same pattern matched fine.
-          PATTERN='^(error(\[[A-Z0-9]+\])?:|FAILED|panicked|##\[error\])'
-          START=$(grep -nE "$PATTERN" clean.log | head -1 | cut -d: -f1)
+          # Two tiers. A real toolchain diagnostic always beats the runner's
+          # own "##[error]Process completed with exit code N", which is true
+          # of every failed step and explains nothing -- so that generic line
+          # is only consulted when nothing better exists, rather than
+          # competing on document order.
+          DIAGNOSTIC='^(error(\[[A-Z0-9]+\])?:|FAILED|panicked at|thread .* panicked)'
+          GENERIC='^##\[error\]'
+          START=$(grep -nE "$DIAGNOSTIC" clean.log | head -1 | cut -d: -f1)
+          if [ -z "$START" ]; then
+            START=$(grep -nE "$GENERIC" clean.log | head -1 | cut -d: -f1)
+            [ -n "$START" ] && echo "no toolchain diagnostic found; falling back to the runner's error line"
+          fi
           TRUNCATED=""
           if [ -n "$START" ]; then
+            echo "first error at line $START: $(sed -n "${START}p" clean.log | cut -c1-80)"
             sed -n "${START},$((START + 19))p" clean.log > excerpt.txt
           fi
           # Also covers the case where the window came back empty for any
