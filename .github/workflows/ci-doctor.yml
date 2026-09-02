@@ -192,18 +192,77 @@ jobs:
             echo "$MARKER"
           } > body.md
 
-          # Update the existing issue for this fingerprint if one is open.
-          EXISTING=$(gh issue list --repo "$REPO" --label ci-failure --state open \
-            --limit 100 --json number,body \
-            --jq "[.[] | select(.body | contains(\"$FP\"))] | .[0].number // empty")
+          # Match on fingerprint across open AND closed issues. Searching only
+          # open ones would defeat the dedup entirely once the resolve job
+          # below starts closing things: a flaky failure would file a fresh
+          # issue after every green run. Reopening instead means an
+          # intermittent failure shows up as one ticket that keeps reopening,
+          # which reads unmistakably as "flaky" -- a pile of identical issues
+          # does not.
+          CUTOFF=$(date -u -d '30 days ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+                   || date -u -v-30d +%Y-%m-%dT%H:%M:%SZ)
+          MATCH=$(gh issue list --repo "$REPO" --label ci-failure --state all \
+            --limit 100 --json number,body,state,closedAt \
+            --jq "[.[] | select(.body | contains(\"$FP\"))
+                       | select(.state == \"OPEN\" or .closedAt > \"$CUTOFF\")]
+                  | .[0] // empty")
 
-          if [ -n "$EXISTING" ]; then
-            echo "same failure as open issue #$EXISTING; commenting"
-            gh issue comment "$EXISTING" --repo "$REPO" --body \
+          # Guard the empty case explicitly rather than defaulting MATCH to an
+          # empty object -- brace-escaping inside ${VAR:-...} does not survive
+          # into valid JSON and jq dies on it.
+          NUM=""; STATE=""
+          if [ -n "$MATCH" ]; then
+            NUM=$(jq -r '.number' <<<"$MATCH")
+            STATE=$(jq -r '.state' <<<"$MATCH")
+          fi
+
+          if [ "$STATE" = "OPEN" ]; then
+            echo "same failure as open issue #$NUM; commenting"
+            gh issue comment "$NUM" --repo "$REPO" --body \
               "Still failing as of [run #$RUN_NUMBER]($RUN_URL) (\`${HEAD_SHA:0:12}\`)."
+          elif [ "$STATE" = "CLOSED" ]; then
+            echo "failure #$NUM has recurred; reopening"
+            gh issue reopen "$NUM" --repo "$REPO"
+            gh issue comment "$NUM" --repo "$REPO" --body \
+              "Reopened: this failure has recurred as of [run #$RUN_NUMBER]($RUN_URL) (\`${HEAD_SHA:0:12}\`), having previously been closed when CI went green. A failure that reopens repeatedly is intermittent rather than fixed."
           else
             SUMMARY=$(grep -m1 -v '^[[:space:]]*$' excerpt.txt | cut -c1-110)
             TITLE="[CI failure] $JOB_NAME${SUMMARY:+: $SUMMARY}"
             gh issue create --repo "$REPO" --title "$TITLE" \
               --label ci-failure --body-file body.md
           fi
+
+  # Green CI on main is the only thing that closes a ci-failure issue.
+  # Deliberately not "a PR saying Fixes #N merged": that records who intended
+  # to fix something, not whether it is fixed, and it never fires for a fix
+  # that arrived outside the pipeline -- a direct push, a revert, a PR that
+  # referenced a different issue. #18 was exactly that case and would have sat
+  # open forever. A green run means every job passed, so no recorded failure
+  # still reproduces at this commit; closing is an observation, not a guess.
+  #
+  # The cost is closing a flaky failure that merely did not fire this time.
+  # The reopen path in triage above corrects that, and turns it into signal.
+  resolve:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Close ci-failure issues that no longer reproduce
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          RUN_NUMBER: ${{ github.event.workflow_run.run_number }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          OPEN=$(gh issue list --repo "$REPO" --label ci-failure --state open \
+            --limit 100 --json number --jq '.[].number')
+          if [ -z "$OPEN" ]; then
+            echo "no open ci-failure issues; nothing to resolve"
+            exit 0
+          fi
+          for n in $OPEN; do
+            echo "closing #$n (ci green on main)"
+            gh issue close "$n" --repo "$REPO" --reason completed --comment \
+              "Closing: \`ci\` passed on \`main\` at [run #$RUN_NUMBER]($RUN_URL) (\`${HEAD_SHA:0:12}\`), so this failure no longer reproduces. If it recurs, this issue is reopened rather than replaced."
+          done

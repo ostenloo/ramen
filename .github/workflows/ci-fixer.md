@@ -148,10 +148,6 @@ safe-outputs:
     max: 1
   add-comment:
     max: 1
-  close-issue:
-    target: "*"
-    state-reason: completed
-    max: 1
 
 timeout-minutes: 60
 ---
@@ -204,15 +200,21 @@ ${{ needs.pre_activation.outputs.issue_body }}
 
 5. **Open the pull request**: use the `create_pull_request` safe-output tool.
    The PR body must include:
-   - which issue it fixes (`Fixes #${{ needs.pre_activation.outputs.issue_number }}`)
+   - which issue it addresses, written as
+     `Refs #${{ needs.pre_activation.outputs.issue_number }}` — deliberately
+     NOT `Fixes #N`, because that makes GitHub close the issue the moment
+     the PR merges, which asserts the fix worked before anything has
+     verified it. ci-doctor closes the issue when `ci` actually passes on
+     `main`.
    - a short explanation of the root cause and the change
    - a note that local verification is unavailable on this Linux runner and
      the change is verified by the repository's CI
 
 6. **Report back**: use the `add_comment` safe-output tool to comment the PR
-   link on the issue, then use the `close_issue` safe-output tool to close the
-   issue (state: completed). The PR carries the work forward; the queue
-   entry is done.
+   link on the issue. Leave the issue OPEN. You do not decide whether the
+   problem is solved — opening a PR records that you did work, not that the
+   failure is gone. ci-doctor closes the issue when `ci` passes on `main`,
+   and reopens it if the failure recurs.
 
 ## Rules
 
